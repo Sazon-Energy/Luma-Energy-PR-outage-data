@@ -12,19 +12,27 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.x'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Captures the real exit code as a step output (rather than just
+      # success/failure) so the steps below can tell a WAF block (exit code 2,
+      # worth retrying via the headless-browser fallback) apart from any other
+      # error, such as a Supabase permission or schema problem, which
+      # wouldn't be fixed by retrying and shouldn't trigger the fallback.
       - name: Scrape
         id: scrape
         continue-on-error: true
-        run: python -m src
+        run: |
+          python -m src && exit_code=0 || exit_code=$?
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+          exit "$exit_code"
 
       # The LUMA outage API sits behind an Incapsula WAF that occasionally
       # blocks direct requests even with browser-like headers. When that
@@ -33,7 +41,7 @@ jobs:
       # which passes the WAF like any other browser visit. This mirrors the
       # approach proven by https://github.com/jpadilla/tracking-luma-outages.
       - name: Run browserless
-        if: steps.scrape.outcome == 'failure'
+        if: steps.scrape.outputs.exit_code == '2'
         run: |
           docker run -d \
             --name browserless \
@@ -44,7 +52,7 @@ jobs:
           sleep 5
 
       - name: Capture region snapshot via browserless
-        if: steps.scrape.outcome == 'failure'
+        if: steps.scrape.outputs.exit_code == '2'
         run: |
           curl -s --request POST \
             --url http://localhost:3000/function \
@@ -54,10 +62,16 @@ jobs:
           cat /tmp/clients_without_service.json
 
       - name: Scrape using captured snapshot
-        if: steps.scrape.outcome == 'failure'
+        if: steps.scrape.outputs.exit_code == '2'
         run: python -m src
         env:
           CLIENTS_WITHOUT_SERVICE_FILE: /tmp/clients_without_service.json
+
+      - name: Fail job on non-WAF scrape error
+        if: steps.scrape.outputs.exit_code != '0' && steps.scrape.outputs.exit_code != '2'
+        run: |
+          echo "::error::Scrape failed for a reason other than a WAF block (see the Scrape step log above) - not retrying via the browserless fallback."
+          exit 1
 
       - name: Stop browserless
         if: always()

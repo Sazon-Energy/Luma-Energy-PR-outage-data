@@ -42,3 +42,10 @@ create table if not exists region_readings (
 
 create index if not exists region_readings_region_name_idx on region_readings (region_name);
 create index if not exists region_readings_snapshot_id_idx on region_readings (snapshot_id);
+
+-- Tables created through the Supabase SQL editor are not always covered by
+-- Supabase's automatic default-privilege grants, so service_role (the key
+-- the collector authenticates with) needs to be granted access explicitly.
+-- Without this, writes fail with "permission denied for table ...".
+grant select, insert on outage_snapshots to service_role;
+grant select, insert on region_readings to service_role;

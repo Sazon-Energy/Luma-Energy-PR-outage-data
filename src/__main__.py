@@ -4,13 +4,19 @@ from src.fetch import OutageApiBlockedError, fetch_region_snapshot
 from src.parse import parse_snapshot
 from src.supabase_writer import build_supabase_client, write_snapshot
 
+# Distinct from any other failure so the GitHub Actions workflow can tell a
+# WAF block (worth retrying via the headless-browser fallback) apart from a
+# real error such as a Supabase permission or schema problem (not worth
+# retrying, since retrying the fetch again would just fail the same way).
+WAF_BLOCKED_EXIT_CODE = 2
+
 
 def main() -> int:
     try:
         response_body = fetch_region_snapshot()
     except OutageApiBlockedError as blocked_error:
         print(f"error: {blocked_error}", file=sys.stderr)
-        return 1
+        return WAF_BLOCKED_EXIT_CODE
 
     snapshot_record, region_records = parse_snapshot(response_body)
 
