@@ -1,0 +1,64 @@
+name: Collect LUMA outage snapshot
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Scrape
+        id: scrape
+        continue-on-error: true
+        run: python -m src
+
+      # The LUMA outage API sits behind an Incapsula WAF that occasionally
+      # blocks direct requests even with browser-like headers. When that
+      # happens, fall back to loading the real status page in a headless
+      # browser and intercepting the same XHR response the page itself makes,
+      # which passes the WAF like any other browser visit. This mirrors the
+      # approach proven by https://github.com/jpadilla/tracking-luma-outages.
+      - name: Run browserless
+        if: steps.scrape.outcome == 'failure'
+        run: |
+          docker run -d \
+            --name browserless \
+            -p 3000:3000 \
+            -e "MAX_CONCURRENT_SESSIONS=1" \
+            -e "QUEUE_LENGTH=0" \
+            browserless/chrome
+          sleep 5
+
+      - name: Capture region snapshot via browserless
+        if: steps.scrape.outcome == 'failure'
+        run: |
+          curl -s --request POST \
+            --url http://localhost:3000/function \
+            --header 'Content-Type: application/json' \
+            --data '{"code": "module.exports=async({page})=>{await page.goto(\"https://miluma.lumapr.com/outages/serviceStatus\");const xhrResponse=await page.waitForResponse(r=>r.request().url().includes(\"/outage/regionsWithoutService\")&&r.request().method()===\"GET\");const xhrPayload=await xhrResponse.json();return{data:xhrPayload,type:\"application/json\"}};"}' \
+            --output /tmp/clients_without_service.json
+          cat /tmp/clients_without_service.json
+
+      - name: Scrape using captured snapshot
+        if: steps.scrape.outcome == 'failure'
+        run: python -m src
+        env:
+          CLIENTS_WITHOUT_SERVICE_FILE: /tmp/clients_without_service.json
+
+      - name: Stop browserless
+        if: always()
+        run: docker rm --force browserless || true
