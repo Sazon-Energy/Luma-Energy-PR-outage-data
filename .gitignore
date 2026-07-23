@@ -1,3 +1,6 @@
+# macOS
+.DS_Store
+
 # Secrets
 .env
 
@@ -7,3 +10,7 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+
+# Generated dashboard output (built by src/dashboard, deployed to Pages
+# straight from the workflow - never committed)
+/site/

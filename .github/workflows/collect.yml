@@ -2,7 +2,14 @@ name: Collect LUMA outage snapshot
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    # Matches the source feed's own refresh rate (roughly every 10 minutes),
+    # so essentially every update it publishes gets captured. This directly
+    # improves SAIFI/CAIDI accuracy: both are estimated from level samples,
+    # and a shorter interval means fewer outages start and end invisibly
+    # between two samples. Affordable only because this repo is public
+    # (unlimited Actions minutes); on a private repo this cadence would
+    # exceed the 2,000 free minutes/month.
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -66,6 +73,16 @@ jobs:
         run: python -m src
         env:
           CLIENTS_WITHOUT_SERVICE_FILE: /tmp/clients_without_service.json
+
+      # Only runs once a snapshot was actually written this run - i.e. the
+      # direct scrape succeeded (exit code 0), or the WAF-blocked path (exit
+      # code 2) recovered via the browserless fallback above. If the
+      # fallback itself failed, that step's own failure already means this
+      # one is skipped (its implicit success() check catches that), so no
+      # extra condition is needed for that case.
+      - name: Recompute reliability metrics
+        if: steps.scrape.outputs.exit_code == '0' || steps.scrape.outputs.exit_code == '2'
+        run: python -m src.metrics
 
       - name: Fail job on non-WAF scrape error
         if: steps.scrape.outputs.exit_code != '0' && steps.scrape.outputs.exit_code != '2'
