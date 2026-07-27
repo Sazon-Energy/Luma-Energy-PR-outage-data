@@ -51,12 +51,25 @@ def main() -> int:
         supabase_client, cause_basis=DASHBOARD_CAUSE_BASIS
     )
 
+    hourly_points_by_cause = {
+        "unplanned": load_metric_series(supabase_client, "hour", cause_basis="unplanned"),
+        "planned": load_metric_series(supabase_client, "hour", cause_basis="planned"),
+        "load_shed": load_metric_series(supabase_client, "hour", cause_basis="load_shed"),
+    }
+    daily_points_by_cause = {
+        "unplanned": load_metric_series(supabase_client, "day", cause_basis="unplanned"),
+        "planned": load_metric_series(supabase_client, "day", cause_basis="planned"),
+        "load_shed": load_metric_series(supabase_client, "day", cause_basis="load_shed"),
+    }
+
     page_html = build_dashboard_html(
         hourly_points=hourly_points,
         daily_points=daily_points,
         monthly_points=monthly_points,
         region_daily_points=region_daily_points,
         major_event_days=major_event_days,
+        hourly_points_by_cause=hourly_points_by_cause,
+        daily_points_by_cause=daily_points_by_cause,
     )
 
     arguments.output.parent.mkdir(parents=True, exist_ok=True)

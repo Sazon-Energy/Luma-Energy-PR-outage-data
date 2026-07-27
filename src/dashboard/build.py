@@ -23,6 +23,13 @@ COLOR_ACCENT = "#e8833a"
 COLOR_MAJOR_EVENT = "#c0392b"
 COLOR_MUTED = "#94a3b8"
 
+# Bottom-to-top stack order for build_customers_out_figure.
+CUSTOMERS_OUT_SEGMENTS = [
+    ("unplanned", "Unplanned", COLOR_PRIMARY),
+    ("planned", "Planned", COLOR_ACCENT),
+    ("load_shed", "Load shed", COLOR_MUTED),
+]
+
 MINUTES_PER_DAY = 1440
 
 
@@ -41,6 +48,103 @@ def _figure_to_html(figure: graph_objects.Figure) -> str:
 
 def _empty_state(message: str) -> str:
     return f'<div class="empty-state">{html.escape(message)}</div>'
+
+
+def _customers_out_axis(
+    points_by_cause: dict[str, list[MetricPoint]], limit: int
+) -> list[datetime]:
+    all_period_starts = {
+        point.period_start for points in points_by_cause.values() for point in points
+    }
+    return sorted(all_period_starts)[-limit:]
+
+
+def _customers_out_series(
+    points: list[MetricPoint], axis: list[datetime]
+) -> list[float]:
+    mean_by_period_start = {
+        point.period_start: point.mean_customers_without_service for point in points
+    }
+    return [mean_by_period_start.get(period_start, 0.0) for period_start in axis]
+
+
+def build_customers_out_figure(
+    hourly_points_by_cause: dict[str, list[MetricPoint]],
+    daily_points_by_cause: dict[str, list[MetricPoint]],
+) -> str:
+    """Customers out of service, stacked by cause, hourly (36h) or daily (30d).
+
+    Both granularities are baked into one figure as separate trace groups;
+    the hourly/daily buttons flip which group is visible, so the toggle needs
+    no JavaScript beyond what Plotly already ships.
+    """
+    hourly_axis = _customers_out_axis(hourly_points_by_cause, 36)
+    daily_axis = _customers_out_axis(daily_points_by_cause, 30)
+    if not hourly_axis and not daily_axis:
+        return _empty_state("No outage data collected yet.")
+
+    figure = graph_objects.Figure()
+    for cause_basis, label, color in CUSTOMERS_OUT_SEGMENTS:
+        figure.add_trace(
+            graph_objects.Bar(
+                x=hourly_axis,
+                y=_customers_out_series(hourly_points_by_cause[cause_basis], hourly_axis),
+                name=label,
+                marker_color=color,
+                visible=True,
+                hovertemplate="%{y:,.0f} customers<extra>" + label + "</extra>",
+            )
+        )
+    for cause_basis, label, color in CUSTOMERS_OUT_SEGMENTS:
+        figure.add_trace(
+            graph_objects.Bar(
+                x=daily_axis,
+                y=_customers_out_series(daily_points_by_cause[cause_basis], daily_axis),
+                name=label,
+                marker_color=color,
+                visible=False,
+                hovertemplate="%{y:,.0f} customers<extra>" + label + "</extra>",
+            )
+        )
+
+    figure.update_layout(
+        title="Customers out of service",
+        yaxis_title="Customers out (period average)",
+        xaxis_title="Hour (Puerto Rico local time)",
+        barmode="stack",
+        legend=dict(orientation="h", y=1.12, x=0),
+        updatemenus=[
+            dict(
+                type="buttons",
+                direction="right",
+                showactive=True,
+                active=0,
+                x=1.0,
+                y=1.18,
+                xanchor="right",
+                yanchor="bottom",
+                buttons=[
+                    dict(
+                        label="Hourly · 36 h",
+                        method="update",
+                        args=[
+                            {"visible": [True, True, True, False, False, False]},
+                            {"xaxis.title.text": "Hour (Puerto Rico local time)"},
+                        ],
+                    ),
+                    dict(
+                        label="Daily · 30 d",
+                        method="update",
+                        args=[
+                            {"visible": [False, False, False, True, True, True]},
+                            {"xaxis.title.text": "Day (Puerto Rico local time)"},
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+    return _figure_to_html(figure)
 
 
 def build_outage_level_figure(hourly_points: list[MetricPoint]) -> str:
@@ -357,6 +461,8 @@ def build_dashboard_html(
     monthly_points: list[MetricPoint],
     region_daily_points: list[MetricPoint],
     major_event_days: list[MajorEventDayPoint],
+    hourly_points_by_cause: dict[str, list[MetricPoint]],
+    daily_points_by_cause: dict[str, list[MetricPoint]],
 ) -> str:
     generated_at = datetime.now(timezone.utc)
 
@@ -494,6 +600,8 @@ def build_dashboard_html(
       <span>All causes (planned, unplanned and load shed)</span>
     </div>
   </header>
+
+  <div class="card">{build_customers_out_figure(hourly_points_by_cause, daily_points_by_cause)}</div>
 
   {build_kpi_cards(window_summary, window_label)}
 
