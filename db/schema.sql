@@ -118,3 +118,59 @@ create index if not exists major_event_days_lookup_idx
 -- (and delete) in addition to insert.
 grant select, insert, update, delete on reliability_metrics to service_role;
 grant select, insert, update, delete on major_event_days    to service_role;
+
+
+-- ---------------------------------------------------------------------------
+-- Reliable 10-minute collection trigger
+-- ---------------------------------------------------------------------------
+-- GitHub Actions' native `schedule:` cron trigger is best-effort: GitHub
+-- silently delays or drops scheduled runs under load, especially for
+-- sub-15-minute intervals on public/low-traffic repos. Measured on this repo,
+-- the configured 10-minute schedule (.github/workflows/collect.yml) was
+-- actually firing roughly every 100 minutes on average - about 90% of ticks
+-- were dropped.
+--
+-- workflow_dispatch (an API-triggered run) starts within seconds, unlike
+-- `schedule`, which sits in a deprioritized queue. So instead of trusting
+-- GitHub's scheduler, Postgres's own scheduler (pg_cron) calls GitHub's
+-- workflow_dispatch REST API every 10 minutes to ask collect.yml to run
+-- right now. The `schedule:` trigger in collect.yml is left in place as a
+-- harmless redundant fallback - source_timestamp is unique on
+-- outage_snapshots, so an occasional double-trigger just no-ops.
+--
+-- One-time manual step (deliberately NOT in this file, since it needs a real
+-- credential): create a GitHub personal access token scoped to only this
+-- repo with the "Actions: Read and write" permission, then store it with
+--   select vault.create_secret('<paste-your-token-here>', 'github_actions_pat',
+--     'Triggers collect.yml via pg_cron; Actions:write only, scoped to this repo.');
+-- See the README's "One-time setup" section for the full walkthrough.
+
+create extension if not exists pg_cron;
+create extension if not exists pg_net;
+
+do $$
+begin
+    if exists (select 1 from cron.job where jobname = 'trigger_luma_collect') then
+        perform cron.unschedule('trigger_luma_collect');
+    end if;
+end $$;
+
+select cron.schedule(
+    'trigger_luma_collect',
+    '*/10 * * * *',
+    $$
+    select net.http_post(
+        url := 'https://api.github.com/repos/Sazon-Energy/Luma-Energy-PR-outage-data/actions/workflows/collect.yml/dispatches',
+        headers := jsonb_build_object(
+            'Authorization', 'Bearer ' || (
+                select decrypted_secret from vault.decrypted_secrets
+                where name = 'github_actions_pat'
+            ),
+            'Accept', 'application/vnd.github+json',
+            'X-GitHub-Api-Version', '2022-11-28',
+            'Content-Type', 'application/json'
+        ),
+        body := jsonb_build_object('ref', 'main')
+    );
+    $$
+);

@@ -2,8 +2,18 @@ name: Collect LUMA outage snapshot
 
 on:
   schedule:
-    # Matches the source feed's own refresh rate (roughly every 10 minutes),
-    # so essentially every update it publishes gets captured. This directly
+    # GitHub's native schedule trigger is best-effort and, measured on this
+    # repo, actually fired roughly every 100 minutes instead of every 10 -
+    # GitHub silently delays/drops sub-15-minute schedules under load,
+    # especially on public/low-traffic repos. The real 10-minute clock is a
+    # Supabase pg_cron job (see db/schema.sql) that calls this workflow's
+    # workflow_dispatch API directly, since API-triggered runs start within
+    # seconds. This schedule trigger is kept only as a harmless redundant
+    # fallback - source_timestamp is unique on outage_snapshots, so an
+    # occasional double-trigger just no-ops.
+    #
+    # The 10-minute target matches the source feed's own refresh rate, so
+    # essentially every update it publishes gets captured. This directly
     # improves SAIFI/CAIDI accuracy: both are estimated from level samples,
     # and a shorter interval means fewer outages start and end invisibly
     # between two samples. Affordable only because this repo is public
@@ -67,6 +77,19 @@ jobs:
             --data '{"code": "module.exports=async({page})=>{await page.goto(\"https://miluma.lumapr.com/outages/serviceStatus\");const xhrResponse=await page.waitForResponse(r=>r.request().url().includes(\"/outage/regionsWithoutService\")&&r.request().method()===\"GET\");const xhrPayload=await xhrResponse.json();return{data:xhrPayload,type:\"application/json\"}};"}' \
             --output /tmp/clients_without_service.json
           cat /tmp/clients_without_service.json
+
+      # browserless returns plain error text (e.g. a Puppeteer navigation or
+      # waitForResponse timeout) instead of JSON when the capture itself
+      # fails, and the step above writes whatever it gets without checking.
+      # Left unvalidated, that surfaces two steps later as a confusing
+      # Python JSONDecodeError instead of a clear cause - fail fast here.
+      - name: Validate browserless capture
+        if: steps.scrape.outputs.exit_code == '2'
+        run: |
+          if ! jq empty /tmp/clients_without_service.json 2>/dev/null; then
+            echo "::error::browserless did not return valid JSON - see the 'Capture region snapshot via browserless' step's output above for the actual response (likely a Puppeteer timeout or navigation error)."
+            exit 1
+          fi
 
       - name: Scrape using captured snapshot
         if: steps.scrape.outputs.exit_code == '2'
