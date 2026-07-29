@@ -21,7 +21,7 @@ Municipality/town-level detail is not collected yet - see **Roadmap** below.
 Supabase pg_cron (every 10 minutes)
   -> calls GitHub's workflow_dispatch API for collect.yml
 GitHub Actions "Collect LUMA outage snapshot" (workflow_dispatch, plus a
-best-effort schedule: as a fallback)
+best-effort schedule: every 30 min as a fallback)
   -> python -m src              fetch + parse + write one snapshot
        (falls back to a headless browser if the WAF blocks the request)
   -> python -m src.metrics      recompute reliability indices from history
@@ -141,8 +141,9 @@ trapezoidal-integration / rising-edge methodology.
 7. Push this repository to GitHub so
    [`.github/workflows/collect.yml`](.github/workflows/collect.yml) can run.
    The Supabase `pg_cron` job from step 2 is the real 10-minute clock; the
-   workflow's own `schedule:` trigger is just a redundant fallback, and the
-   workflow can also be run on demand from the Actions tab ("Run workflow").
+   workflow's own `schedule:` trigger (every 30 minutes) is just a
+   redundant fallback, and the workflow can also be run on demand from the
+   Actions tab ("Run workflow").
 
 ## Running locally
 

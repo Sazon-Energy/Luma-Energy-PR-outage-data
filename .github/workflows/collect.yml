@@ -2,24 +2,23 @@ name: Collect LUMA outage snapshot
 
 on:
   schedule:
-    # GitHub's native schedule trigger is best-effort and, measured on this
-    # repo, actually fired roughly every 100 minutes instead of every 10 -
-    # GitHub silently delays/drops sub-15-minute schedules under load,
-    # especially on public/low-traffic repos. The real 10-minute clock is a
-    # Supabase pg_cron job (see db/schema.sql) that calls this workflow's
-    # workflow_dispatch API directly, since API-triggered runs start within
-    # seconds. This schedule trigger is kept only as a harmless redundant
-    # fallback - source_timestamp is unique on outage_snapshots, so an
-    # occasional double-trigger just no-ops.
+    # GitHub's native schedule trigger is best-effort: measured on this repo
+    # while set to */10, it actually fired roughly every 100 minutes instead
+    # of every 10 - GitHub silently delays/drops sub-15-minute schedules
+    # under load, especially on public/low-traffic repos. The real
+    # 10-minute clock is a Supabase pg_cron job (see db/schema.sql) that
+    # calls this workflow's workflow_dispatch API directly, since
+    # API-triggered runs start within seconds and skip GitHub's scheduling
+    # queue entirely.
     #
-    # The 10-minute target matches the source feed's own refresh rate, so
-    # essentially every update it publishes gets captured. This directly
-    # improves SAIFI/CAIDI accuracy: both are estimated from level samples,
-    # and a shorter interval means fewer outages start and end invisibly
-    # between two samples. Affordable only because this repo is public
-    # (unlimited Actions minutes); on a private repo this cadence would
-    # exceed the 2,000 free minutes/month.
-    - cron: '*/10 * * * *'
+    # This trigger is kept only as a fallback in case the pg_cron job (or
+    # its GitHub token in Supabase Vault) ever breaks - source_timestamp is
+    # unique on outage_snapshots, so an occasional double-trigger with
+    # pg_cron just no-ops. Set to 30 minutes rather than 10: a coarser
+    # target has a better chance of actually firing (less queue
+    # contention), and there's no real precision to preserve here since
+    # GitHub never reliably honored the tighter interval anyway.
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
