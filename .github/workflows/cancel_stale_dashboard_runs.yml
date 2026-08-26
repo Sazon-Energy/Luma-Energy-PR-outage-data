@@ -1,0 +1,47 @@
+name: Cancel stale dashboard-publish runs
+
+# publish_dashboard.yml uses a `pages` concurrency group with
+# cancel-in-progress: false, so a run that gets wedged before it ever starts
+# (e.g. stuck on an unresolvable GitHub Pages environment approval, as
+# happened from 2026-08-06 to 2026-08-26 - see git history) permanently
+# blocks every later trigger: each new collect.yml success queues a new run
+# behind it, and GitHub only keeps one run queued per concurrency group at a
+# time, so every later trigger just cancels the one before it - none of them
+# ever get a turn to actually run.
+#
+# This sweeps for publish_dashboard.yml runs stuck queued/waiting/pending for
+# too long and cancels them, so a single wedged run can't silently kill the
+# whole pipeline again. GitHub's native `schedule:` trigger fires unreliably
+# on this repo (observed roughly every 60-100 minutes rather than the stated
+# interval - see README.md), which is acceptable here since this is a safety
+# net, not a tight-latency mechanism.
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  cancel-stale-runs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel publish_dashboard.yml runs stuck queued/waiting/pending
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          stale_after_minutes=20
+          cutoff=$(date -u -d "-${stale_after_minutes} minutes" +%Y-%m-%dT%H:%M:%SZ)
+
+          gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow publish_dashboard.yml \
+            --limit 50 \
+            --json databaseId,status,createdAt \
+            --jq ".[] | select(.status == \"queued\" or .status == \"waiting\" or .status == \"pending\") | select(.createdAt < \"$cutoff\") | .databaseId" |
+          while read -r run_id; do
+            echo "Cancelling stale run $run_id (queued/waiting/pending longer than ${stale_after_minutes}m)"
+            gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY" || true
+          done
