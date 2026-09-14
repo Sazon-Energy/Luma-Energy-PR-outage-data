@@ -12,6 +12,7 @@ from datetime import datetime
 from supabase import Client
 
 from src.metrics.reliability import ISLAND_SCOPE_NAME
+from src.retry import with_retry
 
 READ_PAGE_SIZE = 1000
 
@@ -95,10 +96,11 @@ def load_metric_series(
         if scope_name is not None:
             query = query.eq("scope_name", scope_name)
 
-        response = (
-            query.order("period_start")
+        response = with_retry(
+            lambda: query.order("period_start")
             .range(offset, offset + READ_PAGE_SIZE - 1)
-            .execute()
+            .execute(),
+            description="select reliability_metrics",
         )
         rows = response.data or []
         points.extend(_to_metric_point(row) for row in rows)
@@ -113,13 +115,14 @@ def load_major_event_days(
     cause_basis: str = "all",
     scope_name: str = ISLAND_SCOPE_NAME,
 ) -> list[MajorEventDayPoint]:
-    response = (
-        supabase_client.table("major_event_days")
+    response = with_retry(
+        lambda: supabase_client.table("major_event_days")
         .select("*")
         .eq("scope_name", scope_name)
         .eq("cause_basis", cause_basis)
         .order("event_date")
-        .execute()
+        .execute(),
+        description="select major_event_days",
     )
     return [
         MajorEventDayPoint(

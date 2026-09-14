@@ -10,6 +10,7 @@ from src.constants import (
     STATUS_PAGE_URL,
     USER_AGENTS,
 )
+from src.retry import with_retry
 
 
 class OutageApiBlockedError(Exception):
@@ -47,8 +48,11 @@ def fetch_region_snapshot() -> dict:
             return json.load(override_file)
 
     session = build_session()
-    response = session.get(
-        REGION_ENDPOINT_URL, timeout=REQUEST_TIMEOUT_SECONDS, allow_redirects=True
+    response = with_retry(
+        lambda: session.get(
+            REGION_ENDPOINT_URL, timeout=REQUEST_TIMEOUT_SECONDS, allow_redirects=True
+        ),
+        description="fetch LUMA regionsWithoutService",
     )
 
     try:

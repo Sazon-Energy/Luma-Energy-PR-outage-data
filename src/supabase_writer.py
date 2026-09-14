@@ -5,6 +5,7 @@ import os
 from supabase import Client, create_client
 
 from src.parse import RegionRecord, SnapshotRecord
+from src.retry import with_retry
 
 
 def build_supabase_client() -> Client:
@@ -42,10 +43,11 @@ def write_snapshot(
         ),
     }
 
-    insert_response = (
-        supabase_client.table("outage_snapshots")
+    insert_response = with_retry(
+        lambda: supabase_client.table("outage_snapshots")
         .upsert(snapshot_row, on_conflict="source_timestamp", ignore_duplicates=True)
-        .execute()
+        .execute(),
+        description="upsert outage_snapshots",
     )
 
     if not insert_response.data:
@@ -79,6 +81,15 @@ def write_snapshot(
     ]
 
     if region_rows:
-        supabase_client.table("region_readings").insert(region_rows).execute()
+        with_retry(
+            lambda: supabase_client.table("region_readings")
+            .upsert(
+                region_rows,
+                on_conflict="snapshot_id,region_name",
+                ignore_duplicates=True,
+            )
+            .execute(),
+            description="upsert region_readings",
+        )
 
     return snapshot_id

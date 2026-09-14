@@ -12,6 +12,7 @@ from src.metrics.reliability import (
     OutageSample,
     ReliabilityMetrics,
 )
+from src.retry import with_retry
 
 # PostgREST caps rows per request, so raw history is pulled in pages.
 READ_PAGE_SIZE = 1000
@@ -40,10 +41,11 @@ def load_island_samples(
         if since is not None:
             query = query.gte("source_timestamp", since.isoformat())
 
-        response = (
-            query.order("source_timestamp")
+        response = with_retry(
+            lambda: query.order("source_timestamp")
             .range(offset, offset + READ_PAGE_SIZE - 1)
-            .execute()
+            .execute(),
+            description="select outage_snapshots",
         )
         rows = response.data or []
         for row in rows:
@@ -85,7 +87,10 @@ def load_region_samples(
         if since is not None:
             query = query.gte("outage_snapshots.source_timestamp", since.isoformat())
 
-        response = query.range(offset, offset + READ_PAGE_SIZE - 1).execute()
+        response = with_retry(
+            lambda: query.range(offset, offset + READ_PAGE_SIZE - 1).execute(),
+            description="select region_readings",
+        )
         rows = response.data or []
         for row in rows:
             related_snapshot = row.get("outage_snapshots") or {}
@@ -158,9 +163,12 @@ def write_reliability_metrics(
 
     for batch_start in range(0, len(rows), WRITE_BATCH_SIZE):
         batch = rows[batch_start : batch_start + WRITE_BATCH_SIZE]
-        supabase_client.table("reliability_metrics").upsert(
-            batch, on_conflict="granularity,period_start,scope_name,cause_basis"
-        ).execute()
+        with_retry(
+            lambda: supabase_client.table("reliability_metrics")
+            .upsert(batch, on_conflict="granularity,period_start,scope_name,cause_basis")
+            .execute(),
+            description="upsert reliability_metrics",
+        )
 
     return len(rows)
 
@@ -173,15 +181,16 @@ def load_daily_saidi_history(
     offset = 0
 
     while True:
-        response = (
-            supabase_client.table("reliability_metrics")
+        response = with_retry(
+            lambda: supabase_client.table("reliability_metrics")
             .select("period_start,saidi_minutes")
             .eq("granularity", "day")
             .eq("scope_name", scope_name)
             .eq("cause_basis", cause_basis)
             .order("period_start")
             .range(offset, offset + READ_PAGE_SIZE - 1)
-            .execute()
+            .execute(),
+            description="select reliability_metrics",
         )
         rows = response.data or []
         for row in rows:
@@ -224,9 +233,12 @@ def write_major_event_days(
 
     for batch_start in range(0, len(rows), WRITE_BATCH_SIZE):
         batch = rows[batch_start : batch_start + WRITE_BATCH_SIZE]
-        supabase_client.table("major_event_days").upsert(
-            batch, on_conflict="event_date,scope_name,cause_basis"
-        ).execute()
+        with_retry(
+            lambda: supabase_client.table("major_event_days")
+            .upsert(batch, on_conflict="event_date,scope_name,cause_basis")
+            .execute(),
+            description="upsert major_event_days",
+        )
 
     return len(rows)
 
