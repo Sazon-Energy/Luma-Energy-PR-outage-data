@@ -110,6 +110,37 @@ def load_metric_series(
         offset += READ_PAGE_SIZE
 
 
+def load_snapshot_timestamps(
+    supabase_client: Client, since: datetime
+) -> list[datetime]:
+    """Every raw `source_timestamp` collected since `since`, oldest first.
+
+    Read straight from `outage_snapshots` rather than the derived metrics, so
+    sample coverage reflects exactly which LUMA publishes were captured.
+    """
+    timestamps: list[datetime] = []
+    offset = 0
+
+    while True:
+        query = (
+            supabase_client.table("outage_snapshots")
+            .select("source_timestamp")
+            .gte("source_timestamp", since.isoformat())
+        )
+        response = with_retry(
+            lambda: query.order("source_timestamp")
+            .range(offset, offset + READ_PAGE_SIZE - 1)
+            .execute(),
+            description="select outage_snapshots",
+        )
+        rows = response.data or []
+        timestamps.extend(_parse_timestamp(row["source_timestamp"]) for row in rows)
+
+        if len(rows) < READ_PAGE_SIZE:
+            return timestamps
+        offset += READ_PAGE_SIZE
+
+
 def load_major_event_days(
     supabase_client: Client,
     cause_basis: str = "all",

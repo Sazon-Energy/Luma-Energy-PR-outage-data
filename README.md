@@ -156,7 +156,7 @@ set -a && source .env && set +a
 
 python -m src              # collect one snapshot
 python -m src.metrics      # recompute reliability metrics (add --full to rebuild all history)
-python -m src.dashboard    # render site/index.html
+python -m src.dashboard    # render site/index.html and site/indices.html
 ```
 
 A successful collection run prints either a new snapshot id or a message that

@@ -1,4 +1,5 @@
-"""Renders the reliability dashboard as a self-contained static HTML page.
+"""Renders the reliability dashboard as self-contained static HTML pages,
+styled to match sazonenergy.com.
 
 Everything is produced from Python via Plotly, so there is almost no
 JavaScript to maintain and no server to run - the figures carry their own
@@ -11,20 +12,26 @@ from __future__ import annotations
 
 import html
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import plotly.graph_objects as graph_objects
 import plotly.io as plotly_io
 
 from src.dashboard.data import MajorEventDayPoint, MetricPoint
+from src.metrics.reliability import PUERTO_RICO_TIMEZONE
 
 PLOTLY_TEMPLATE = "plotly_white"
 FIGURE_CONFIG = {"displayModeBar": False, "responsive": True}
 
-COLOR_PRIMARY = "#0f6fc5"
-COLOR_ACCENT = "#e8833a"
-COLOR_MAJOR_EVENT = "#c0392b"
+# Sazon Energy palette (sazonenergy.com): brand orange, slate secondary, and
+# the deep rust end of the brand gradient for Major Event Days.
+COLOR_PRIMARY = "#ff9933"
+COLOR_PRIMARY_FILL = "rgba(255,153,51,0.18)"
+COLOR_PRIMARY_BAR = "rgba(255,153,51,0.6)"
+COLOR_ACCENT = "#1e293b"
+COLOR_MAJOR_EVENT = "#8b2500"
 COLOR_MUTED = "#94a3b8"
+FONT_FAMILY = "Inter, -apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif"
 
 # Bottom-to-top stack order for build_customers_out_figure.
 CUSTOMERS_OUT_SEGMENTS = [
@@ -34,6 +41,11 @@ CUSTOMERS_OUT_SEGMENTS = [
 ]
 
 MINUTES_PER_DAY = 1440
+
+# LUMA publishes a new outage figure every 10 minutes, so a day holds at most
+# this many distinct measurements. Sample coverage is captured ÷ possible.
+SAMPLE_INTERVAL_MINUTES = 10
+EXPECTED_SAMPLES_PER_DAY = MINUTES_PER_DAY // SAMPLE_INTERVAL_MINUTES
 
 # The main chart's daily view can look back this far; the start-date slider
 # never covers more than this many days even if more history exists.
@@ -51,11 +63,6 @@ VIEW_OPTIONS = [
 ]
 DEFAULT_VIEW_INDEX = 0
 
-# The KPI cards always summarize this many trailing days, independent of the
-# main chart's slider position, except when a day-granularity view is active,
-# in which case they track that view's window instead.
-DEFAULT_WINDOW_LENGTH_DAYS = 30
-
 CUSTOMERS_OUT_FIGURE_DIV_ID = "customers-out-figure"
 
 
@@ -64,14 +71,25 @@ def _figure_to_html(
     div_id: str | None = None,
     margin_top: int = 48,
     height: int = 380,
+    allow_selection: bool = False,
 ) -> str:
     figure.update_layout(
         template=PLOTLY_TEMPLATE,
         margin=dict(l=56, r=24, t=margin_top, b=48),
         height=height,
         hovermode="x unified",
-        font=dict(family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif"),
+        font=dict(family=FONT_FAMILY, color="#1f2937"),
+        title_font=dict(size=15, color="#1e293b"),
     )
+    if not allow_selection:
+        # Hover read-outs stay, but legend toggling and zoom are switched off
+        # so these charts always show the full period, exactly as published.
+        figure.update_layout(
+            dragmode=False,
+            legend=dict(itemclick=False, itemdoubleclick=False),
+        )
+        figure.update_xaxes(fixedrange=True)
+        figure.update_yaxes(fixedrange=True)
     extra_kwargs = {"div_id": div_id} if div_id else {}
     return plotly_io.to_html(
         figure,
@@ -171,7 +189,8 @@ def _build_customers_out_figure(
         )
 
     figure.update_layout(
-        title=dict(text="Customers out of service", y=0.97, yanchor="top"),
+        # The chart title lives in the HTML above the figure (see
+        # `build_customers_out_section`) so it can sit centered as a label.
         yaxis_title="Customers out (hourly mean)",
         xaxis=dict(title="Hour (Puerto Rico local time)", autorange="reversed"),
         barmode="stack",
@@ -180,8 +199,48 @@ def _build_customers_out_figure(
     return figure, hourly_axis
 
 
+def count_captured_samples_by_day(
+    snapshot_timestamps: list[datetime],
+) -> dict[date, int]:
+    """Distinct 10-minute slots holding at least one snapshot, per local day.
+
+    Counting slots rather than raw rows means an off-cadence or duplicate
+    publish can never push a day past `EXPECTED_SAMPLES_PER_DAY`.
+    """
+    captured_slots_by_day: dict[date, set[int]] = {}
+    for snapshot_timestamp in snapshot_timestamps:
+        local_moment = snapshot_timestamp.astimezone(PUERTO_RICO_TIMEZONE)
+        minute_of_day = local_moment.hour * 60 + local_moment.minute
+        captured_slots_by_day.setdefault(local_moment.date(), set()).add(
+            minute_of_day // SAMPLE_INTERVAL_MINUTES
+        )
+    return {
+        local_date: len(captured_slots)
+        for local_date, captured_slots in captured_slots_by_day.items()
+    }
+
+
+def expected_samples_for_day(local_date: date, generated_at: datetime) -> int:
+    """How many measurements LUMA could have published on `local_date`.
+
+    A full past day has `EXPECTED_SAMPLES_PER_DAY`; the current day only
+    counts the slots that have begun by build time, so it isn't marked down
+    for measurements that cannot exist yet.
+    """
+    local_now = generated_at.astimezone(PUERTO_RICO_TIMEZONE)
+    if local_date < local_now.date():
+        return EXPECTED_SAMPLES_PER_DAY
+    if local_date > local_now.date():
+        return 0
+    minute_of_day = local_now.hour * 60 + local_now.minute
+    return min(
+        EXPECTED_SAMPLES_PER_DAY, minute_of_day // SAMPLE_INTERVAL_MINUTES + 1
+    )
+
+
 def build_window_controls_markup(available_days: int) -> str:
-    """The 48h/30d/60d/90d view buttons and the always-visible day slider.
+    """Date range + coverage, the 48h/30d/60d/90d view buttons, the
+    always-visible day slider, and the chart title with its reset button.
 
     `available_days` only decides whether the slider starts disabled; the
     inline script recomputes its min/max/ticks in JavaScript whenever the
@@ -200,36 +259,51 @@ def build_window_controls_markup(available_days: int) -> str:
         <div class="window-btn-group" role="group" aria-label="Chart window">
           {view_buttons}
         </div>
-        <span class="window-range-group">
-          <span class="window-granularity-label" id="window-granularity-label"></span>
+        <div class="window-summary">
           <span class="window-range-label" id="window-range-label"></span>
-        </span>
+          <span class="coverage-stat tooltip-anchor" tabindex="0" aria-describedby="window-coverage-tooltip">
+            <span class="coverage-name">Coverage</span>
+            <span class="coverage-value" id="window-coverage-value">—</span>
+            <span class="hover-tooltip" id="window-coverage-tooltip" role="tooltip"></span>
+          </span>
+        </div>
       </div>
       <div class="window-slider-row" id="window-slider-row">
         <label for="window-start-slider">Start date</label>
         <input type="range" id="window-start-slider" min="0" max="0" value="0"
-               step="1" list="window-tick-marks" {slider_disabled}>
-        <datalist id="window-tick-marks"></datalist>
+               step="1" list="window-start-dates" {slider_disabled}>
+        <datalist id="window-start-dates"></datalist>
       </div>
-      <div class="window-slider-hint" id="window-slider-hint"></div>
+      <div class="chart-title-row">
+        <h3 class="chart-title">Customers out of service</h3>
+        <button type="button" class="cause-reset-btn" id="cause-focus-reset" hidden>
+          Show all outage types
+        </button>
+      </div>
     </div>"""
 
 
 def build_window_controls_script(
-    daily_axis: list[datetime], daily_points: list[MetricPoint]
+    daily_axis: list[datetime],
+    snapshot_timestamps: list[datetime],
+    generated_at: datetime,
 ) -> str:
-    """Inline script wiring the controls to the figure and the KPI cards.
-
-    Recomputes SAIDI/SAIFI/CAIDI/ASAI client-side using the same formulas as
-    `summarize_window`, over whichever window the slider currently selects.
+    """Inline script wiring the view buttons and slider to the figure, and
+    keeping the date range and sample coverage in step with the window shown.
     """
-    saidi_by_date = {point.period_start.date(): point.saidi_minutes for point in daily_points}
-    saifi_by_date = {point.period_start.date(): point.saifi_estimated for point in daily_points}
+    captured_samples_by_day = count_captured_samples_by_day(snapshot_timestamps)
+    local_dates = [
+        period_start.astimezone(PUERTO_RICO_TIMEZONE).date() for period_start in daily_axis
+    ]
 
     daily_data = {
         "dates": [period_start.strftime("%Y-%m-%d") for period_start in daily_axis],
-        "saidi": [saidi_by_date.get(period_start.date(), 0.0) for period_start in daily_axis],
-        "saifi": [saifi_by_date.get(period_start.date(), 0.0) for period_start in daily_axis],
+        "capturedSamples": [
+            captured_samples_by_day.get(local_date, 0) for local_date in local_dates
+        ],
+        "expectedSamples": [
+            expected_samples_for_day(local_date, generated_at) for local_date in local_dates
+        ],
     }
     payload = json.dumps(daily_data)
     view_options_payload = json.dumps(VIEW_OPTIONS)
@@ -243,15 +317,19 @@ def build_window_controls_script(
       var viewOptions = JSON.parse(document.getElementById('window-view-options').textContent);
       var figureDiv = document.getElementById('{CUSTOMERS_OUT_FIGURE_DIV_ID}');
       var slider = document.getElementById('window-start-slider');
-      var sliderHint = document.getElementById('window-slider-hint');
-      var tickMarks = document.getElementById('window-tick-marks');
+      var startDateOptions = document.getElementById('window-start-dates');
+      var causeResetButton = document.getElementById('cause-focus-reset');
       var rangeLabel = document.getElementById('window-range-label');
-      var granularityLabel = document.getElementById('window-granularity-label');
+      var coverageValue = document.getElementById('window-coverage-value');
+      var coverageTooltip = document.getElementById('window-coverage-tooltip');
       var buttons = document.querySelectorAll('.window-btn');
       var availableDays = dailyData.dates.length;
       var activeView = viewOptions[{DEFAULT_VIEW_INDEX}];
-      var minutesPerDay = {MINUTES_PER_DAY};
-      var defaultKpiWindowDays = {DEFAULT_WINDOW_LENGTH_DAYS};
+      var sampleIntervalMinutes = {SAMPLE_INTERVAL_MINUTES};
+      var expectedSamplesPerDay = {EXPECTED_SAMPLES_PER_DAY};
+      // The figure holds one trace per outage type for the hourly group,
+      // followed by the same types again for the daily group.
+      var outageTypeCount = {len(CUSTOMERS_OUT_SEGMENTS)};
 
       function formatDate(isoDate) {{
         if (!isoDate) return '';
@@ -281,42 +359,57 @@ def build_window_controls_script(
         target.classList.add('active');
       }}
 
-      function updateKpiCardsForRange(startIndex, endIndex) {{
-        var slice = {{ saidi: [], saifi: [] }};
-        for (var i = Math.max(startIndex, 0); i <= endIndex && i < availableDays; i++) {{
-          slice.saidi.push(dailyData.saidi[i]);
-          slice.saifi.push(dailyData.saifi[i]);
+      // Pooled over the window (total captured ÷ total possible), not an
+      // average of daily percentages, so a partial day can't skew it.
+      function updateSampleCoverageForRange(startIndex, endIndex) {{
+        var capturedTotal = 0;
+        var expectedTotal = 0;
+        for (var dayIndex = Math.max(startIndex, 0); dayIndex <= endIndex && dayIndex < availableDays; dayIndex++) {{
+          capturedTotal += dailyData.capturedSamples[dayIndex];
+          expectedTotal += dailyData.expectedSamples[dayIndex];
         }}
-        var days = slice.saidi.length;
-        var totalSaidi = slice.saidi.reduce(function(a, b) {{ return a + b; }}, 0);
-        var totalSaifi = slice.saifi.reduce(function(a, b) {{ return a + b; }}, 0);
-        var caidi = totalSaifi > 0 ? totalSaidi / totalSaifi : null;
-        var asai = days > 0 ? (1 - totalSaidi / (days * minutesPerDay)) * 100 : null;
-
-        var saidiEl = document.getElementById('kpi-saidi-value');
-        var saifiEl = document.getElementById('kpi-saifi-value');
-        var caidiEl = document.getElementById('kpi-caidi-value');
-        var asaiEl = document.getElementById('kpi-asai-value');
-        if (saidiEl) saidiEl.innerHTML = formatMetric(days ? totalSaidi : null, "<span class='metric-suffix'> min</span>", 2);
-        if (saifiEl) saifiEl.innerHTML = formatMetric(days ? totalSaifi : null, "<span class='metric-suffix'></span>", 4);
-        if (caidiEl) caidiEl.innerHTML = formatMetric(caidi, "<span class='metric-suffix'> min</span>", 1);
-        if (asaiEl) asaiEl.innerHTML = formatMetric(asai, "<span class='metric-suffix'> %</span>", 4);
-
-        var windowLabelEl = document.getElementById('kpi-window-label');
-        if (windowLabelEl) {{
-          windowLabelEl.textContent = days
-            ? 'last ' + days + ' day(s) with data'
-            : 'awaiting data';
+        var cadenceNote = 'LUMA publishes outage data every ' + sampleIntervalMinutes +
+          ' minutes (up to ' + expectedSamplesPerDay + ' measurements per day).';
+        if (expectedTotal === 0) {{
+          coverageValue.textContent = '—';
+          coverageTooltip.textContent = 'Not yet measurable for the selected period. ' + cadenceNote;
+          return;
         }}
+        coverageValue.textContent = formatMetric(capturedTotal / expectedTotal * 100, '%', 1);
+        coverageTooltip.textContent =
+          capturedTotal.toLocaleString() + ' of ' + expectedTotal.toLocaleString() +
+          ' possible measurements captured in the selected period. ' + cadenceNote;
       }}
 
-      // The KPI cards are a stable headline figure - they track the exact
-      // slider window for day-length views, but stay on the standard 30-day
-      // summary for the 48h view, since 2 days isn't a meaningful sample.
-      function updateKpiCardsDefault() {{
-        var endIndex = availableDays - 1;
-        var startIndex = Math.max(0, availableDays - defaultKpiWindowDays);
-        updateKpiCardsForRange(startIndex, endIndex);
+      // Which outage types are shown, read from whichever trace group is
+      // currently on screen: true, or 'legendonly' once hidden through the
+      // legend (a click hides one type; a double-click focuses on one type).
+      function readOutageTypeVisibility() {{
+        var visibility = [];
+        for (var typeIndex = 0; typeIndex < outageTypeCount; typeIndex++) {{
+          var hourlyVisible = figureDiv.data[typeIndex].visible;
+          var dailyVisible = figureDiv.data[typeIndex + outageTypeCount].visible;
+          var shownVisible = hourlyVisible !== false ? hourlyVisible : dailyVisible;
+          visibility.push(shownVisible === 'legendonly' ? 'legendonly' : true);
+        }}
+        return visibility;
+      }}
+
+      function updateCauseResetButton() {{
+        causeResetButton.hidden = readOutageTypeVisibility().every(function(visible) {{
+          return visible === true;
+        }});
+      }}
+
+      // Applies the given per-type visibility to the active granularity's
+      // trace group and hides the other group entirely, so a legend focus
+      // carries across start-date and view changes.
+      function showTraceGroup(granularity, outageTypeVisibility) {{
+        var hiddenGroup = outageTypeVisibility.map(function() {{ return false; }});
+        var visible = granularity === 'hour'
+          ? outageTypeVisibility.concat(hiddenGroup)
+          : hiddenGroup.concat(outageTypeVisibility);
+        Plotly.restyle(figureDiv, {{ visible: visible }});
       }}
 
       // The window always spans exactly the active view's number of days -
@@ -342,8 +435,8 @@ def build_window_controls_script(
         var actualDays = endIndex - startIndex + 1;
         var dayCountSuffix = ' (' + actualDays + (actualDays === 1 ? ' day)' : ' days)');
 
+        showTraceGroup(activeView.granularity, readOutageTypeVisibility());
         if (activeView.granularity === 'hour') {{
-          Plotly.restyle(figureDiv, {{ visible: [true, true, true, false, false, false] }});
           Plotly.relayout(figureDiv, {{
             'xaxis.autorange': false,
             // range given newest-first so the most recent hour renders on the
@@ -354,10 +447,7 @@ def build_window_controls_script(
             'yaxis.title.text': 'Customers out (hourly mean)',
             'yaxis.autorange': true
           }});
-          granularityLabel.textContent = 'Hourly data (mean per hour)';
-          updateKpiCardsDefault();
         }} else {{
-          Plotly.restyle(figureDiv, {{ visible: [false, false, false, true, true, true] }});
           Plotly.relayout(figureDiv, {{
             'xaxis.autorange': false,
             'xaxis.range': [endDate, startDate],
@@ -365,15 +455,15 @@ def build_window_controls_script(
             'yaxis.title.text': 'Customers out (daily peak)',
             'yaxis.autorange': true
           }});
-          granularityLabel.textContent = 'Daily data (peak per day)';
-          updateKpiCardsForRange(startIndex, endIndex);
         }}
 
         rangeLabel.textContent = formatDate(startDate) + ' – ' + formatDate(endDate) + dayCountSuffix;
+        updateSampleCoverageForRange(startIndex, endIndex);
+        updateCauseResetButton();
       }}
 
-      // Ticks and slider bounds depend on the active view's window length -
-      // a short window has many valid start dates, a long one has few.
+      // Slider bounds depend on the active view's window length - a short
+      // window has many valid start dates, a long one has few.
       function configureSliderForView() {{
         var length = activeView.days;
         var maxOffset = Math.max(0, availableDays - length);
@@ -382,20 +472,12 @@ def build_window_controls_script(
         slider.value = 0;
         slider.disabled = availableDays === 0;
 
-        tickMarks.innerHTML = '';
-        for (var i = 0; i <= maxOffset; i++) {{
+        startDateOptions.innerHTML = '';
+        for (var startOffset = 0; startOffset <= maxOffset; startOffset++) {{
           var option = document.createElement('option');
-          option.value = i;
-          option.label = formatDate(dailyData.dates[availableDays - 1 - i]);
-          tickMarks.appendChild(option);
-        }}
-
-        if (availableDays < length) {{
-          sliderHint.textContent = 'Only ' + availableDays + ' day(s) of data available - showing full history.';
-        }} else if (maxOffset === 0) {{
-          sliderHint.textContent = 'Exactly ' + length + ' day(s) of data available.';
-        }} else {{
-          sliderHint.textContent = 'Drag to any of the ' + (maxOffset + 1) + ' available views (one tick per day).';
+          option.value = startOffset;
+          option.label = formatDate(dailyData.dates[availableDays - 1 - startOffset]);
+          startDateOptions.appendChild(option);
         }}
       }}
 
@@ -412,6 +494,17 @@ def build_window_controls_script(
         applyView(parseInt(slider.value, 10));
       }});
 
+      causeResetButton.addEventListener('click', function() {{
+        showTraceGroup(
+          activeView.granularity,
+          readOutageTypeVisibility().map(function() {{ return true; }})
+        );
+        updateCauseResetButton();
+      }});
+
+      // Legend clicks and double-clicks surface as restyle events.
+      figureDiv.on('plotly_restyle', updateCauseResetButton);
+
       configureSliderForView();
       applyView(0);
     }})();
@@ -421,7 +514,8 @@ def build_window_controls_script(
 def build_customers_out_section(
     hourly_points_by_cause: dict[str, list[MetricPoint]],
     daily_points_by_cause: dict[str, list[MetricPoint]],
-    daily_points: list[MetricPoint],
+    snapshot_timestamps: list[datetime],
+    generated_at: datetime,
 ) -> str:
     """Controls + figure for customers-out-of-service: 48h / 30d / 60d / 90d views.
 
@@ -439,11 +533,17 @@ def build_customers_out_section(
         hourly_points_by_cause, daily_axis, daily_points_by_cause
     )
     figure_html = _figure_to_html(
-        figure, div_id=CUSTOMERS_OUT_FIGURE_DIV_ID, margin_top=72, height=400
+        figure,
+        div_id=CUSTOMERS_OUT_FIGURE_DIV_ID,
+        margin_top=40,
+        height=400,
+        allow_selection=True,
     )
 
     controls_html = build_window_controls_markup(len(daily_axis))
-    script_html = build_window_controls_script(daily_axis, daily_points)
+    script_html = build_window_controls_script(
+        daily_axis, snapshot_timestamps, generated_at
+    )
 
     return f"{controls_html}{figure_html}{script_html}"
 
@@ -463,7 +563,7 @@ def build_outage_level_figure(hourly_points: list[MetricPoint]) -> str:
             mode="lines",
             line=dict(color=COLOR_PRIMARY, width=2),
             fill="tozeroy",
-            fillcolor="rgba(15,111,197,0.12)",
+            fillcolor=COLOR_PRIMARY_FILL,
             hovertemplate="%{y:,.0f} customers<extra>mean</extra>",
         )
     )
@@ -601,7 +701,7 @@ def build_customer_minutes_escalation_figure(hourly_points: list[MetricPoint]) -
             x=[point.period_start for point in recent_points],
             y=[point.customer_minutes_interrupted for point in recent_points],
             name="Customer-minutes per hour",
-            marker_color="rgba(15,111,197,0.55)",
+            marker_color=COLOR_PRIMARY_BAR,
             hovertemplate="%{y:,.0f} customer-min<extra>this hour</extra>",
         )
     )
@@ -668,7 +768,7 @@ def summarize_window(points: list[MetricPoint], window_days: int | None = None) 
     if window_days is not None and points:
         cutoff = points[-1].period_start - timedelta(days=window_days)
         selected_points = [
-            point for point in points if point.period_start >= cutoff
+            point for point in points if point.period_start > cutoff
         ]
 
     if not selected_points:
@@ -678,16 +778,12 @@ def summarize_window(points: list[MetricPoint], window_days: int | None = None) 
             "caidi": None,
             "asai": None,
             "days": 0,
-            "coverage": None,
+            "first_period_start": None,
+            "last_period_start": None,
         }
 
     total_saidi = sum(point.saidi_minutes for point in selected_points)
     total_saifi = sum(point.saifi_estimated for point in selected_points)
-    coverage_values = [
-        point.coverage_ratio
-        for point in selected_points
-        if point.coverage_ratio is not None
-    ]
 
     return {
         "saidi": total_saidi,
@@ -697,9 +793,8 @@ def summarize_window(points: list[MetricPoint], window_days: int | None = None) 
             (1.0 - total_saidi / (len(selected_points) * MINUTES_PER_DAY)) * 100.0
         ),
         "days": len(selected_points),
-        "coverage": (
-            sum(coverage_values) / len(coverage_values) if coverage_values else None
-        ),
+        "first_period_start": selected_points[0].period_start,
+        "last_period_start": selected_points[-1].period_start,
     }
 
 
@@ -709,11 +804,17 @@ def _format_metric(value: float | None, suffix: str, decimals: int = 2) -> str:
     return f"{value:,.{decimals}f}<span class='metric-suffix'>{suffix}</span>"
 
 
-def build_kpi_cards(summary: dict, window_label: str) -> str:
+def _format_local_date(moment: datetime) -> str:
+    local_date = moment.astimezone(PUERTO_RICO_TIMEZONE).date()
+    return f"{local_date:%b} {local_date.day}, {local_date.year}"
+
+
+def build_kpi_cards(summary: dict) -> str:
     cards = [
         (
             "saidi",
             "SAIDI",
+            "System Average Interruption Duration Index",
             _format_metric(summary["saidi"], " min"),
             "Minutes of interruption per customer served",
             "solid",
@@ -721,6 +822,7 @@ def build_kpi_cards(summary: dict, window_label: str) -> str:
         (
             "saifi",
             "SAIFI",
+            "System Average Interruption Frequency Index",
             _format_metric(summary["saifi"], "", 4),
             "Interruptions per customer — lower bound",
             "estimated",
@@ -728,6 +830,7 @@ def build_kpi_cards(summary: dict, window_label: str) -> str:
         (
             "caidi",
             "CAIDI",
+            "Customer Average Interruption Duration Index",
             _format_metric(summary["caidi"], " min", 1),
             "Average restoration time — upper bound",
             "estimated",
@@ -735,6 +838,7 @@ def build_kpi_cards(summary: dict, window_label: str) -> str:
         (
             "asai",
             "ASAI",
+            "Average Service Availability Index",
             _format_metric(summary["asai"], " %", 4),
             "Service availability",
             "solid",
@@ -745,75 +849,286 @@ def build_kpi_cards(summary: dict, window_label: str) -> str:
         f"""
         <div class="kpi-card">
           <div class="kpi-header">
-            <span class="kpi-name">{name}</span>
-            <span class="badge badge-{quality}">{quality}</span>
+            <span class="kpi-name tooltip-anchor" tabindex="0" aria-describedby="kpi-{slug}-full-name">
+              {name}
+              <span class="hover-tooltip" id="kpi-{slug}-full-name" role="tooltip">{html.escape(full_name)}</span>
+            </span>
+            <span class="status-badge status-{quality}"><span class="status-dot"></span>{quality}</span>
           </div>
-          <div class="kpi-value" id="kpi-{slug}-value">{value}</div>
+          <div class="kpi-value">{value}</div>
           <div class="kpi-note">{html.escape(note)}</div>
         </div>"""
-        for slug, name, value, note, quality in cards
+        for slug, name, full_name, value, note, quality in cards
     )
-
-    return f"""
-    <section class="kpi-section">
-      <div class="section-heading">
-        <h2>Island-wide reliability</h2>
-        <span class="window-label" id="kpi-window-label">{html.escape(window_label)}</span>
-      </div>
-      <div class="kpi-grid">{card_markup}</div>
-    </section>"""
+    return f'<div class="kpi-grid">{card_markup}</div>'
 
 
-def build_dashboard_html(
-    hourly_points: list[MetricPoint],
-    daily_points: list[MetricPoint],
-    monthly_points: list[MetricPoint],
-    region_daily_points: list[MetricPoint],
-    major_event_days: list[MajorEventDayPoint],
-    hourly_points_by_cause: dict[str, list[MetricPoint]],
-    daily_points_by_cause: dict[str, list[MetricPoint]],
-) -> str:
-    generated_at = datetime.now(timezone.utc)
+def _major_event_day_note(major_event_days: list[MajorEventDayPoint]) -> str:
+    """Status of the Major Event Day threshold, as trusted HTML."""
+    if not major_event_days:
+        return "No Major Event Day classification yet."
 
-    window_summary = summarize_window(daily_points, window_days=30)
-    all_time_summary = summarize_window(daily_points)
-
-    window_label = (
-        f"last {window_summary['days']} day(s) with data"
-        if window_summary["days"]
-        else "awaiting data"
-    )
-
-    provisional_note = ""
-    if major_event_days:
-        latest = major_event_days[-1]
-        flagged_count = sum(
-            1 for point in major_event_days if point.is_major_event_day
+    latest = major_event_days[-1]
+    if latest.threshold_t_med is None:
+        return (
+            f"Major Event Day threshold not yet computable — "
+            f"{latest.days_used_in_threshold} day(s) of non-zero SAIDI so far "
+            f"(30 needed, IEEE 1366 calls for five years)."
         )
-        if latest.threshold_t_med is None:
-            provisional_note = (
-                f"Major Event Day threshold not yet computable — "
-                f"{latest.days_used_in_threshold} day(s) of non-zero SAIDI so far "
-                f"(30 needed, IEEE 1366 calls for five years)."
-            )
-        else:
-            provisional_note = (
-                f"T<sub>MED</sub> = {latest.threshold_t_med:,.1f} min from "
-                f"{latest.days_used_in_threshold} day(s); {flagged_count} day(s) "
-                f"classified as Major Event Days."
-                + (
-                    " Provisional — the threshold will move as history accumulates."
-                    if latest.is_provisional
-                    else ""
-                )
-            )
-    else:
-        provisional_note = "No Major Event Day classification yet."
 
-    coverage_note = (
-        f"Mean sample coverage {window_summary['coverage'] * 100:,.1f}%"
-        if window_summary["coverage"] is not None
-        else "Coverage not yet measurable"
+    flagged_count = sum(1 for point in major_event_days if point.is_major_event_day)
+    return (
+        f"T<sub>MED</sub> = {latest.threshold_t_med:,.1f} min from "
+        f"{latest.days_used_in_threshold} day(s); {flagged_count} day(s) "
+        f"classified as Major Event Days."
+        + (
+            " Provisional — the threshold will move as history accumulates."
+            if latest.is_provisional
+            else ""
+        )
+    )
+
+
+# Shared by both pages. A plain string rather than an f-string so the CSS
+# braces need no escaping. Palette and type follow sazonenergy.com.
+PAGE_STYLESHEET = """
+  :root {
+    --primary: #ff9933; --primary-dark: #e55a00; --secondary: #1e293b;
+    --text: #1f2937; --muted: #6b7280; --bg: #ffffff; --bg-secondary: #f8fafc;
+    --border: #e5e7eb;
+    --shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+    --gradient: linear-gradient(135deg, #ff9933 0%, #8b2500 100%);
+    --available: #10b981; --coming-soon: #f59e0b;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    line-height: 1.6; color: var(--text); background: var(--bg-secondary);
+    overflow-x: hidden;
+  }
+
+  /* Header */
+  .site-header {
+    position: sticky; top: 0; z-index: 1000;
+    background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  .site-nav {
+    display: flex; justify-content: space-between; align-items: center; gap: 1rem;
+    max-width: 1200px; margin: 0 auto; padding: 1rem 2rem;
+  }
+  .logo { font-size: 1.5rem; font-weight: 700; color: var(--primary); text-decoration: none; }
+  .nav-links { display: flex; list-style: none; gap: 2rem; }
+  .nav-links a {
+    position: relative; text-decoration: none; color: var(--text); font-weight: 500;
+    transition: color 0.3s ease;
+  }
+  .nav-links a::after {
+    content: ''; position: absolute; bottom: -5px; left: 0; width: 0; height: 2px;
+    background: var(--primary); transition: width 0.3s ease;
+  }
+  .nav-links a:hover, .nav-links a[aria-current="page"] { color: var(--primary); }
+  .nav-links a:hover::after, .nav-links a[aria-current="page"]::after { width: 100%; }
+
+  /* Hero band */
+  .hero { background: var(--gradient); color: #fff; text-align: center; padding: 3.5rem 2rem; }
+  .hero h1 { font-size: clamp(1.9rem, 4vw, 2.75rem); font-weight: 700; line-height: 1.2; }
+  .hero p {
+    max-width: 640px; margin: 0.75rem auto 0; font-size: 1.1rem;
+    color: rgba(255, 255, 255, 0.9);
+  }
+
+  /* Content */
+  .section { max-width: 1200px; margin: 0 auto; padding: 3rem 2rem; }
+  .section-title {
+    text-align: center; font-size: 2rem; font-weight: 700; color: var(--secondary);
+    line-height: 1.25;
+  }
+  .section-subtitle { text-align: center; color: var(--muted); margin: 0.5rem 0 2rem; }
+  .panel {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 15px;
+    box-shadow: var(--shadow); padding: 1.25rem; margin-top: 2rem;
+  }
+  .panel:first-child { margin-top: 0; }
+  .empty-state { padding: 48px 16px; text-align: center; color: var(--muted); font-size: 0.9rem; }
+  .cta-row { text-align: center; margin-top: 2.5rem; }
+  .cta-button {
+    display: inline-block; background: var(--gradient); color: #fff;
+    padding: 0.9rem 1.9rem; border-radius: 50px; font-weight: 600; text-decoration: none;
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+  }
+  .cta-button:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2); }
+  .back-link {
+    display: inline-block; margin-bottom: 1.5rem; color: var(--primary-dark);
+    font-weight: 600; text-decoration: none;
+  }
+  .back-link:hover { text-decoration: underline; text-underline-offset: 4px; }
+
+  /* Main chart controls */
+  .window-controls-row {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px;
+  }
+  .window-btn-group { display: flex; gap: 6px; }
+  .window-btn {
+    font: inherit; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+    min-width: 3.75rem; text-align: center;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 50px; padding: 6px 14px;
+    transition: border-color 0.3s ease, color 0.3s ease;
+  }
+  .window-btn:hover { border-color: var(--primary); color: var(--primary-dark); }
+  .window-btn.active { background: var(--secondary); border-color: var(--secondary); color: #fff; }
+  .window-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  /* Fixed width so nothing after it shifts as the date range text changes. */
+  .window-range-label {
+    font-size: 0.85rem; color: var(--muted); font-weight: 600;
+    font-variant-numeric: tabular-nums; min-width: 17rem;
+  }
+  .coverage-stat {
+    display: inline-flex; align-items: baseline; gap: 8px;
+    border: 1px solid var(--border); border-radius: 50px; padding: 4px 14px;
+    background: var(--bg-secondary);
+  }
+  .coverage-name {
+    font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em;
+    font-weight: 700; color: var(--muted);
+  }
+  .coverage-value {
+    font-size: 0.9rem; font-weight: 700; color: var(--secondary);
+    font-variant-numeric: tabular-nums;
+  }
+  .window-slider-row { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+  .window-slider-row label { font-size: 0.8rem; color: var(--muted); white-space: nowrap; }
+  .window-slider-row input[type="range"] { flex: 1; min-width: 0; accent-color: var(--primary); }
+  .window-slider-row input[type="range"]:disabled { opacity: 0.5; }
+  .chart-title-row {
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
+    gap: 8px; margin-top: 1.25rem; min-height: 32px;
+  }
+  .chart-title {
+    grid-column: 2; text-align: center; font-size: 0.85rem; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.1em; color: var(--secondary);
+  }
+  .cause-reset-btn {
+    grid-column: 3; justify-self: end;
+    font: inherit; font-size: 0.78rem; font-weight: 600; cursor: pointer;
+    background: var(--bg); color: var(--primary-dark); border: 1px solid var(--primary);
+    border-radius: 50px; padding: 4px 12px;
+  }
+  .cause-reset-btn:hover { background: rgba(255, 153, 51, 0.1); }
+  .cause-reset-btn[hidden] { display: none; }
+
+  /* KPI cards */
+  .kpi-grid { display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+  .kpi-card {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 15px;
+    box-shadow: var(--shadow); padding: 1.5rem;
+  }
+  .kpi-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .kpi-name { font-weight: 700; font-size: 1rem; color: var(--secondary); }
+  .kpi-value {
+    font-size: 2rem; font-weight: 700; color: var(--secondary); margin: 0.5rem 0 0.25rem;
+    letter-spacing: -0.02em; font-variant-numeric: tabular-nums;
+  }
+  .metric-suffix { font-size: 0.95rem; font-weight: 500; color: var(--muted); margin-left: 3px; }
+  .metric-empty { color: var(--muted); }
+  .kpi-note { font-size: 0.85rem; color: var(--muted); }
+  .status-badge {
+    display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0.65rem;
+    border-radius: 20px; font-size: 0.68rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .status-solid {
+    background: rgba(16, 185, 129, 0.1); color: var(--available);
+    border: 1px solid rgba(16, 185, 129, 0.2);
+  }
+  .status-solid .status-dot { background: var(--available); }
+  .status-estimated {
+    background: rgba(245, 158, 11, 0.1); color: #b45309;
+    border: 1px solid rgba(245, 158, 11, 0.2);
+  }
+  .status-estimated .status-dot { background: var(--coming-soon); }
+
+  /* Helper panel */
+  .callout {
+    background: var(--bg); border: 1px solid var(--border); border-left: 4px solid var(--primary);
+    border-radius: 15px; padding: 1.5rem 1.75rem; margin-top: 2rem;
+    color: var(--muted); font-size: 0.95rem; line-height: 1.7;
+  }
+  .callout h3 { color: var(--secondary); font-size: 1.1rem; margin-bottom: 0.5rem; }
+  .callout ul { margin: 0.75rem 0 0; padding-left: 1.25rem; }
+  .callout li { margin-bottom: 0.35rem; }
+  .callout strong { color: var(--text); }
+  .callout .callout-note { margin-top: 0.75rem; }
+
+  /* Tooltips: put `tooltip-anchor` on the element and a `hover-tooltip`
+     child inside it. Opens below by default; `tooltip-above` flips it. */
+  .tooltip-anchor { position: relative; }
+  .tooltip-anchor:focus { outline: 2px solid var(--primary); outline-offset: 3px; border-radius: 6px; }
+  .tooltip-anchor:focus:not(:focus-visible) { outline: none; }
+  .hover-tooltip {
+    position: absolute; top: calc(100% + 8px); left: 0; z-index: 1100;
+    width: max-content; max-width: min(300px, 80vw); padding: 10px 12px; border-radius: 10px;
+    background: var(--secondary); color: #fff; text-align: left;
+    font-size: 0.78rem; font-weight: 500; line-height: 1.5;
+    text-transform: none; letter-spacing: normal;
+    box-shadow: 0 10px 25px rgba(15, 23, 42, 0.25);
+    opacity: 0; visibility: hidden; pointer-events: none;
+    transition: opacity 150ms ease;
+  }
+  .tooltip-anchor:hover .hover-tooltip,
+  .tooltip-anchor:focus .hover-tooltip { opacity: 1; visibility: visible; }
+  .tooltip-above { top: auto; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%); }
+  .tooltip-light { background: var(--bg); color: var(--text); max-width: min(420px, 88vw); }
+  .tooltip-line { display: block; }
+  .tooltip-line + .tooltip-line { margin-top: 0.5rem; }
+
+  /* Footer */
+  .site-footer {
+    background: var(--secondary); color: rgba(255, 255, 255, 0.85);
+    text-align: center; padding: 2.5rem 2rem; margin-top: 3rem; font-size: 0.9rem;
+  }
+  .footer-generated { display: inline-flex; align-items: center; gap: 8px; cursor: default; }
+  .info-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 1.5px solid rgba(255, 255, 255, 0.6); font-size: 0.7rem; font-weight: 700;
+    font-style: normal;
+  }
+
+  @media (max-width: 768px) {
+    .site-nav { padding: 0.85rem 1rem; }
+    .logo { font-size: 1.2rem; }
+    .nav-links { gap: 1rem; font-size: 0.9rem; }
+    .hero { padding: 2.5rem 1rem; }
+    .section { padding: 2rem 1rem; }
+    .section-title { font-size: 1.6rem; }
+    .panel { padding: 1rem 0.75rem; }
+    .chart-title-row { grid-template-columns: 1fr; justify-items: center; }
+    .chart-title, .cause-reset-btn { grid-column: 1; justify-self: center; }
+  }
+"""
+
+
+def _render_page(
+    page_title: str,
+    heading: str,
+    lead: str,
+    current_page: str,
+    body_html: str,
+    generated_at: datetime,
+) -> str:
+    """Wrap a page body in the shared Sazon-styled header, hero and footer."""
+    current_marker = ' aria-current="page"'
+    navigation_links = "".join(
+        f'<li><a href="{file_name}"{current_marker if file_name == current_page else ""}>'
+        f"{html.escape(label)}</a></li>"
+        for file_name, label in SITE_PAGES
+    )
+    source_lines = "".join(
+        f'<span class="tooltip-line">{html.escape(line)}</span>'
+        for line in SOURCE_NOTES
     )
 
     return f"""<!doctype html>
@@ -821,159 +1136,153 @@ def build_dashboard_html(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LUMA Puerto Rico — Grid Reliability</title>
+<title>{html.escape(page_title)} — Sazon Energy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js" charset="utf-8"></script>
-<style>
-  :root {{
-    --bg: #f6f8fb; --surface: #ffffff; --text: #0f172a; --muted: #64748b;
-    --border: #e2e8f0; --primary: {COLOR_PRIMARY};
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0; background: var(--bg); color: var(--text);
-    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    line-height: 1.5;
-  }}
-  .page {{ max-width: 1180px; margin: 0 auto; padding: 32px 20px 64px; }}
-  header.masthead {{ margin-bottom: 28px; }}
-  header.masthead h1 {{ margin: 0 0 6px; font-size: 1.75rem; letter-spacing: -0.02em; }}
-  .subtitle {{ color: var(--muted); margin: 0; font-size: 0.95rem; }}
-  .meta-row {{
-    display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 14px;
-    font-size: 0.82rem; color: var(--muted);
-  }}
-  .section-heading {{
-    display: flex; align-items: baseline; justify-content: space-between;
-    gap: 12px; margin: 0 0 14px;
-  }}
-  .section-heading h2 {{ font-size: 1.05rem; margin: 0; letter-spacing: -0.01em; }}
-  .window-label {{ font-size: 0.8rem; color: var(--muted); }}
-  .kpi-grid {{
-    display: grid; gap: 14px;
-    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  }}
-  .kpi-card {{
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; padding: 16px 18px;
-  }}
-  .kpi-header {{ display: flex; align-items: center; justify-content: space-between; }}
-  .kpi-name {{ font-weight: 650; font-size: 0.9rem; }}
-  .kpi-value {{ font-size: 1.9rem; font-weight: 680; margin: 6px 0 2px; letter-spacing: -0.02em; }}
-  .metric-suffix {{ font-size: 0.95rem; font-weight: 500; color: var(--muted); margin-left: 3px; }}
-  .metric-empty {{ color: var(--muted); }}
-  .kpi-note {{ font-size: 0.78rem; color: var(--muted); }}
-  .badge {{
-    font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.05em;
-    padding: 3px 7px; border-radius: 999px; font-weight: 650;
-  }}
-  .badge-solid {{ background: #dcfce7; color: #166534; }}
-  .badge-estimated {{ background: #fef3c7; color: #92400e; }}
-  .card {{
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; padding: 8px 10px; margin-top: 18px;
-  }}
-  .empty-state {{
-    padding: 48px 16px; text-align: center; color: var(--muted);
-    font-size: 0.9rem;
-  }}
-  .window-controls {{ padding: 6px 8px 0; }}
-  .window-controls-row {{
-    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
-    gap: 10px;
-  }}
-  .window-btn-group {{ display: flex; flex-wrap: wrap; gap: 6px; }}
-  .window-btn {{
-    font: inherit; font-size: 0.82rem; font-weight: 600; cursor: pointer;
-    background: var(--surface); color: var(--text); border: 1px solid var(--border);
-    border-radius: 8px; padding: 6px 12px;
-  }}
-  .window-btn:hover {{ border-color: var(--primary); }}
-  .window-btn.active {{ background: var(--primary); border-color: var(--primary); color: #fff; }}
-  .window-range-group {{ display: flex; align-items: center; gap: 8px; }}
-  .window-range-label {{ font-size: 0.82rem; color: var(--muted); font-weight: 600; }}
-  .window-granularity-label {{
-    font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em;
-    font-weight: 650; color: var(--primary); background: color-mix(in srgb, var(--primary) 14%, transparent);
-    border-radius: 999px; padding: 3px 8px;
-  }}
-  .window-slider-row {{
-    display: flex; align-items: center; gap: 12px; margin-top: 10px; padding: 0 2px;
-  }}
-  .window-slider-row label {{ font-size: 0.78rem; color: var(--muted); white-space: nowrap; }}
-  .window-slider-row input[type="range"] {{ flex: 1; accent-color: var(--muted); }}
-  .window-slider-row input[type="range"]:disabled {{ opacity: 0.5; }}
-  .window-slider-hint {{
-    font-size: 0.74rem; color: var(--muted); margin-top: 4px; padding: 0 2px;
-    min-height: 1.1em;
-  }}
-  .callout {{
-    background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px;
-    padding: 14px 16px; margin-top: 26px; font-size: 0.85rem; color: #78350f;
-  }}
-  .callout h3 {{ margin: 0 0 6px; font-size: 0.9rem; }}
-  .callout ul {{ margin: 8px 0 0; padding-left: 18px; }}
-  .callout li {{ margin-bottom: 4px; }}
-  footer {{ margin-top: 34px; font-size: 0.78rem; color: var(--muted); }}
-  @media (prefers-color-scheme: dark) {{
-    :root {{
-      --bg: #0b1120; --surface: #131c2e; --text: #e2e8f0; --muted: #94a3b8;
-      --border: #1e293b;
-    }}
-    .badge-solid {{ background: #14532d; color: #bbf7d0; }}
-    .badge-estimated {{ background: #78350f; color: #fde68a; }}
-    .callout {{ background: #2a2010; border-color: #78350f; color: #fde68a; }}
-  }}
-</style>
+<style>{PAGE_STYLESHEET}</style>
 </head>
 <body>
-<div class="page">
-  <header class="masthead">
-    <h1>LUMA Puerto Rico — Grid Reliability</h1>
-    <p class="subtitle">
-      IEEE 1366 reliability indices derived from the MiLUMA outage feed,
-      sampled every 10 minutes.
-    </p>
-    <div class="meta-row">
-      <span>Generated {generated_at:%Y-%m-%d %H:%M} UTC</span>
-      <span>{html.escape(coverage_note)}</span>
-      <span>All causes (planned, unplanned and load shed)</span>
-    </div>
-  </header>
-
-  <div class="card">{build_customers_out_section(hourly_points_by_cause, daily_points_by_cause, daily_points)}</div>
-
-  {build_kpi_cards(window_summary, window_label)}
-
-  <div class="card">{build_outage_level_figure(hourly_points)}</div>
-  <div class="card">{build_customer_minutes_escalation_figure(hourly_points)}</div>
-  <div class="card">{build_daily_saidi_figure(daily_points, major_event_days)}</div>
-  <div class="card">{build_index_trend_figure(daily_points)}</div>
-  <div class="card">{build_region_comparison_figure(region_daily_points)}</div>
-
-  <div class="callout">
-    <h3>How to read these numbers</h3>
-    <p style="margin:0">
-      The source publishes how many customers are out at a point in time, not an
-      interruption event log. That makes some indices exact and others bounded:
-    </p>
-    <ul>
-      <li><strong>SAIDI, ASAI and customer-minutes are well supported</strong> —
-          they integrate the customers-out curve, which sampled data measures directly.</li>
-      <li><strong>SAIFI is a lower bound.</strong> It is inferred from rising
-          edges, so any outage that begins and ends between two samples is invisible.</li>
-      <li><strong>CAIDI is an upper bound</strong>, since it divides SAIDI by the
-          understated SAIFI. It is the customer-weighted average restoration time.</li>
-      <li><strong>MAIFI (momentary interruptions) is not reported</strong> — it is
-          undetectable at a 10-minute sampling interval.</li>
-    </ul>
-    <p style="margin:8px 0 0">{provisional_note}</p>
-  </div>
-
-  <footer>
-    Source: MiLUMA outage feed. Indices computed per IEEE 1366; Major Event Days
-    classified with the 2.5 Beta Method. Figures over short histories are
-    indicative rather than representative of long-run reliability.
-  </footer>
-</div>
+<header class="site-header">
+  <nav class="site-nav">
+    <a href="{MAIN_PAGE_FILE_NAME}" class="logo">Sazon Energy</a>
+    <ul class="nav-links">{navigation_links}</ul>
+  </nav>
+</header>
+<main>
+  <section class="hero">
+    <h1>{html.escape(heading)}</h1>
+    <p>{html.escape(lead)}</p>
+  </section>
+  <div class="section">{body_html}</div>
+</main>
+<footer class="site-footer">
+  <span class="footer-generated tooltip-anchor" tabindex="0" aria-describedby="source-notes">
+    Generated {generated_at:%Y-%m-%d %H:%M} UTC
+    <i class="info-icon" aria-hidden="true">i</i>
+    <span class="hover-tooltip tooltip-above tooltip-light" id="source-notes" role="tooltip">{source_lines}</span>
+  </span>
+</footer>
 </body>
 </html>"""
+
+
+MAIN_PAGE_FILE_NAME = "index.html"
+INDICES_PAGE_FILE_NAME = "indices.html"
+SITE_PAGES = [
+    (MAIN_PAGE_FILE_NAME, "Grid reliability"),
+    (INDICES_PAGE_FILE_NAME, "Reliability indices"),
+]
+
+# Shown in the footer's "Generated" tooltip on every page.
+SOURCE_NOTES = [
+    "Source: MiLUMA outage feed published by LUMA Energy, sampled every 10 minutes.",
+    "IEEE 1366 reliability indices derived from that feed. All causes are "
+    "counted: planned, unplanned and load shed.",
+    "Indices computed per IEEE 1366; Major Event Days classified with the "
+    "2.5 Beta Method. Figures over short histories are indicative rather than "
+    "representative of long-run reliability.",
+]
+
+
+def build_main_page_html(
+    hourly_points_by_cause: dict[str, list[MetricPoint]],
+    daily_points_by_cause: dict[str, list[MetricPoint]],
+    snapshot_timestamps: list[datetime],
+    generated_at: datetime,
+) -> str:
+    """The interactive customers-out page, linking to the indices page."""
+    body_html = f"""
+    <div class="panel">{build_customers_out_section(hourly_points_by_cause, daily_points_by_cause, snapshot_timestamps, generated_at)}</div>
+    <div class="cta-row">
+      <a class="cta-button" href="{INDICES_PAGE_FILE_NAME}">View reliability indices →</a>
+    </div>"""
+    return _render_page(
+        page_title="Puerto Rico Grid Reliability",
+        heading="Puerto Rico Grid Reliability",
+        lead="Count of LUMA PR customers without service",
+        current_page=MAIN_PAGE_FILE_NAME,
+        body_html=body_html,
+        generated_at=generated_at,
+    )
+
+
+def build_indices_page_html(
+    hourly_points: list[MetricPoint],
+    daily_points: list[MetricPoint],
+    region_daily_points: list[MetricPoint],
+    major_event_days: list[MajorEventDayPoint],
+    generated_at: datetime,
+) -> str:
+    """Static page: headline indices, supporting charts and how to read them,
+    always over all data available up to one year - no selectors."""
+    summary = summarize_window(daily_points, window_days=MAXIMUM_HISTORY_DAYS)
+    if summary["days"]:
+        coverage_sentence = (
+            f"All data available, up to one year: "
+            f"{_format_local_date(summary['first_period_start'])} – "
+            f"{_format_local_date(summary['last_period_start'])} "
+            f"({summary['days']} day{'s' if summary['days'] != 1 else ''})"
+        )
+    else:
+        coverage_sentence = "Awaiting the first full day of data."
+
+    body_html = f"""
+    <a class="back-link" href="{MAIN_PAGE_FILE_NAME}">← Back to grid reliability</a>
+    <h2 class="section-title">Island-wide reliability</h2>
+    <p class="section-subtitle">{html.escape(coverage_sentence)}</p>
+    {build_kpi_cards(summary)}
+    <div class="panel">{build_outage_level_figure(hourly_points)}</div>
+    <div class="panel">{build_customer_minutes_escalation_figure(hourly_points)}</div>
+    <div class="panel">{build_daily_saidi_figure(daily_points, major_event_days)}</div>
+    <div class="panel">{build_index_trend_figure(daily_points)}</div>
+    <div class="panel">{build_region_comparison_figure(region_daily_points)}</div>
+
+    <div class="callout">
+      <h3>How to read these numbers</h3>
+      <p>
+        The source publishes how many customers are out at a point in time, not an
+        interruption event log. That makes some indices exact and others bounded:
+      </p>
+      <ul>
+        <li><strong>SAIDI, ASAI and customer-minutes are well supported</strong> —
+            they integrate the customers-out curve, which sampled data measures directly.</li>
+        <li><strong>SAIFI is a lower bound.</strong> It is inferred from rising
+            edges, so any outage that begins and ends between two samples is invisible.</li>
+        <li><strong>CAIDI is an upper bound</strong>, since it divides SAIDI by the
+            understated SAIFI. It is the customer-weighted average restoration time.</li>
+        <li><strong>MAIFI (momentary interruptions) is not reported</strong> — it is
+            undetectable at a 10-minute sampling interval.</li>
+      </ul>
+      <p class="callout-note">{_major_event_day_note(major_event_days)}</p>
+    </div>"""
+    return _render_page(
+        page_title="Reliability Indices",
+        heading="Reliability Indices",
+        lead="IEEE 1366 measures of how often and how long Puerto Rico's grid leaves customers without power.",
+        current_page=INDICES_PAGE_FILE_NAME,
+        body_html=body_html,
+        generated_at=generated_at,
+    )
+
+
+def build_site_pages(
+    hourly_points: list[MetricPoint],
+    daily_points: list[MetricPoint],
+    region_daily_points: list[MetricPoint],
+    major_event_days: list[MajorEventDayPoint],
+    hourly_points_by_cause: dict[str, list[MetricPoint]],
+    daily_points_by_cause: dict[str, list[MetricPoint]],
+    snapshot_timestamps: list[datetime],
+) -> dict[str, str]:
+    """Every page of the site, keyed by file name."""
+    generated_at = datetime.now(timezone.utc)
+    return {
+        MAIN_PAGE_FILE_NAME: build_main_page_html(
+            hourly_points_by_cause, daily_points_by_cause, snapshot_timestamps, generated_at
+        ),
+        INDICES_PAGE_FILE_NAME: build_indices_page_html(
+            hourly_points, daily_points, region_daily_points, major_event_days, generated_at
+        ),
+    }
