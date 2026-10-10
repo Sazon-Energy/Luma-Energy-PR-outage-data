@@ -40,6 +40,11 @@ CUSTOMERS_OUT_SEGMENTS = [
     ("load_shed", "Load shed", COLOR_MUTED),
 ]
 
+# Segments left off the chart when every value is zero. LUMA's feed carries a
+# load-shed count, but it has only ever reported 0; the segment reappears on
+# its own once the feed starts reporting it.
+CAUSE_BASES_HIDDEN_WHEN_EMPTY = {"load_shed"}
+
 MINUTES_PER_DAY = 1440
 
 # LUMA publishes a new outage figure every 10 minutes, so a day holds at most
@@ -128,31 +133,46 @@ def _limit_to_recent_days(
 
 
 def _customers_out_series(
-    points: list[MetricPoint], axis: list[datetime], use_peak: bool = False
+    points: list[MetricPoint], axis: list[datetime]
 ) -> list[float]:
-    """Per-period customers-out values, aligned to `axis`.
+    """Per-period peak customers-out values, aligned to `axis`.
 
-    `use_peak` picks the period's peak instead of its mean. The daily trace
-    uses the peak: a day's mean would average a multi-hour spike down toward
-    zero, understating how bad the worst moment of that day actually was. The
-    hourly trace keeps the mean, since an hour is already fine-grained enough
-    that mean and peak rarely differ much.
+    Both the hourly and daily traces use the period's peak rather than its
+    mean: a mean averages a spike down toward zero, understating how bad the
+    worst moment of the period actually was, and using peak for both keeps
+    the 48h and multi-day views comparable.
     """
     value_by_period_start = {
-        point.period_start: (
-            point.peak_customers_without_service
-            if use_peak
-            else point.mean_customers_without_service
-        )
+        point.period_start: point.peak_customers_without_service
         for point in points
     }
     return [value_by_period_start.get(period_start, 0.0) for period_start in axis]
+
+
+def _customers_out_segments_with_data(
+    hourly_points_by_cause: dict[str, list[MetricPoint]],
+    daily_points_by_cause: dict[str, list[MetricPoint]],
+) -> list[tuple[str, str, str]]:
+    """`CUSTOMERS_OUT_SEGMENTS` minus any hide-when-empty segment that has no
+    nonzero value at either granularity."""
+    shown_segments = []
+    for segment in CUSTOMERS_OUT_SEGMENTS:
+        cause_basis = segment[0]
+        if cause_basis in CAUSE_BASES_HIDDEN_WHEN_EMPTY and not any(
+            point.peak_customers_without_service > 0
+            for points_by_cause in (hourly_points_by_cause, daily_points_by_cause)
+            for point in points_by_cause.get(cause_basis, [])
+        ):
+            continue
+        shown_segments.append(segment)
+    return shown_segments
 
 
 def _build_customers_out_figure(
     hourly_points_by_cause: dict[str, list[MetricPoint]],
     daily_axis: list[datetime],
     daily_points_by_cause: dict[str, list[MetricPoint]],
+    shown_segments: list[tuple[str, str, str]],
 ) -> tuple[graph_objects.Figure, list[datetime]]:
     """Build the figure with hourly and daily trace groups baked in.
 
@@ -163,7 +183,7 @@ def _build_customers_out_figure(
     hourly_axis = _customers_out_axis(hourly_points_by_cause, HOURLY_HISTORY_LIMIT_HOURS)
 
     figure = graph_objects.Figure()
-    for cause_basis, label, color in CUSTOMERS_OUT_SEGMENTS:
+    for cause_basis, label, color in shown_segments:
         figure.add_trace(
             graph_objects.Bar(
                 x=hourly_axis,
@@ -171,16 +191,14 @@ def _build_customers_out_figure(
                 name=label,
                 marker_color=color,
                 visible=True,
-                hovertemplate="%{y:,.0f} customers<extra>" + label + "</extra>",
+                hovertemplate="%{y:,.0f} customers (peak)<extra>" + label + "</extra>",
             )
         )
-    for cause_basis, label, color in CUSTOMERS_OUT_SEGMENTS:
+    for cause_basis, label, color in shown_segments:
         figure.add_trace(
             graph_objects.Bar(
                 x=daily_axis,
-                y=_customers_out_series(
-                    daily_points_by_cause[cause_basis], daily_axis, use_peak=True
-                ),
+                y=_customers_out_series(daily_points_by_cause[cause_basis], daily_axis),
                 name=label,
                 marker_color=color,
                 visible=False,
@@ -191,7 +209,7 @@ def _build_customers_out_figure(
     figure.update_layout(
         # The chart title lives in the HTML above the figure (see
         # `build_customers_out_section`) so it can sit centered as a label.
-        yaxis_title="Customers out (hourly mean)",
+        yaxis_title="Customers out (hourly peak)",
         xaxis=dict(title="Hour (Puerto Rico local time)", autorange="reversed"),
         barmode="stack",
         legend=dict(orientation="h", y=1.1, x=0),
@@ -264,7 +282,7 @@ def build_window_controls_markup(available_days: int) -> str:
           <span class="coverage-stat tooltip-anchor" tabindex="0" aria-describedby="window-coverage-tooltip">
             <span class="coverage-name">Coverage</span>
             <span class="coverage-value" id="window-coverage-value">—</span>
-            <span class="hover-tooltip" id="window-coverage-tooltip" role="tooltip"></span>
+            <span class="hover-tooltip tooltip-align-right" id="window-coverage-tooltip" role="tooltip"></span>
           </span>
         </div>
       </div>
@@ -287,6 +305,7 @@ def build_window_controls_script(
     daily_axis: list[datetime],
     snapshot_timestamps: list[datetime],
     generated_at: datetime,
+    outage_type_count: int,
 ) -> str:
     """Inline script wiring the view buttons and slider to the figure, and
     keeping the date range and sample coverage in step with the window shown.
@@ -329,7 +348,7 @@ def build_window_controls_script(
       var expectedSamplesPerDay = {EXPECTED_SAMPLES_PER_DAY};
       // The figure holds one trace per outage type for the hourly group,
       // followed by the same types again for the daily group.
-      var outageTypeCount = {len(CUSTOMERS_OUT_SEGMENTS)};
+      var outageTypeCount = {outage_type_count};
 
       function formatDate(isoDate) {{
         if (!isoDate) return '';
@@ -444,7 +463,7 @@ def build_window_controls_script(
             // hours are fully included.
             'xaxis.range': [addDays(endDate, 1), startDate],
             'xaxis.title.text': 'Hour (Puerto Rico local time)',
-            'yaxis.title.text': 'Customers out (hourly mean)',
+            'yaxis.title.text': 'Customers out (hourly peak)',
             'yaxis.autorange': true
           }});
         }} else {{
@@ -529,8 +548,11 @@ def build_customers_out_section(
     ):
         return _empty_state("No outage data collected yet.")
 
+    shown_segments = _customers_out_segments_with_data(
+        hourly_points_by_cause, daily_points_by_cause
+    )
     figure, _hourly_axis = _build_customers_out_figure(
-        hourly_points_by_cause, daily_axis, daily_points_by_cause
+        hourly_points_by_cause, daily_axis, daily_points_by_cause, shown_segments
     )
     figure_html = _figure_to_html(
         figure,
@@ -542,7 +564,7 @@ def build_customers_out_section(
 
     controls_html = build_window_controls_markup(len(daily_axis))
     script_html = build_window_controls_script(
-        daily_axis, snapshot_timestamps, generated_at
+        daily_axis, snapshot_timestamps, generated_at, len(shown_segments)
     )
 
     return f"{controls_html}{figure_html}{script_html}"
@@ -940,29 +962,12 @@ PAGE_STYLESHEET = """
 
   /* Content */
   .section { max-width: 1200px; margin: 0 auto; padding: 3rem 2rem; }
-  .section-title {
-    text-align: center; font-size: 2rem; font-weight: 700; color: var(--secondary);
-    line-height: 1.25;
-  }
-  .section-subtitle { text-align: center; color: var(--muted); margin: 0.5rem 0 2rem; }
   .panel {
     background: var(--bg); border: 1px solid var(--border); border-radius: 15px;
     box-shadow: var(--shadow); padding: 1.25rem; margin-top: 2rem;
   }
   .panel:first-child { margin-top: 0; }
   .empty-state { padding: 48px 16px; text-align: center; color: var(--muted); font-size: 0.9rem; }
-  .cta-row { text-align: center; margin-top: 2.5rem; }
-  .cta-button {
-    display: inline-block; background: var(--gradient); color: #fff;
-    padding: 0.9rem 1.9rem; border-radius: 50px; font-weight: 600; text-decoration: none;
-    transition: transform 0.3s ease, box-shadow 0.3s ease;
-  }
-  .cta-button:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2); }
-  .back-link {
-    display: inline-block; margin-bottom: 1.5rem; color: var(--primary-dark);
-    font-weight: 600; text-decoration: none;
-  }
-  .back-link:hover { text-decoration: underline; text-underline-offset: 4px; }
 
   /* Main chart controls */
   .window-controls-row {
@@ -978,23 +983,22 @@ PAGE_STYLESHEET = """
   }
   .window-btn:hover { border-color: var(--primary); color: var(--primary-dark); }
   .window-btn.active { background: var(--secondary); border-color: var(--secondary); color: #fff; }
-  .window-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  .window-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; flex: 1; }
   /* Fixed width so nothing after it shifts as the date range text changes. */
   .window-range-label {
     font-size: 0.85rem; color: var(--muted); font-weight: 600;
     font-variant-numeric: tabular-nums; min-width: 17rem;
   }
   .coverage-stat {
-    display: inline-flex; align-items: baseline; gap: 8px;
-    border: 1px solid var(--border); border-radius: 50px; padding: 4px 14px;
-    background: var(--bg-secondary);
+    display: inline-flex; align-items: baseline; gap: 6px; margin-left: auto;
+    cursor: default;
   }
   .coverage-name {
-    font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em;
-    font-weight: 700; color: var(--muted);
+    font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em;
+    font-weight: 600; color: var(--muted);
   }
   .coverage-value {
-    font-size: 0.9rem; font-weight: 700; color: var(--secondary);
+    font-size: 0.75rem; font-weight: 600; color: var(--muted);
     font-variant-numeric: tabular-nums;
   }
   .window-slider-row { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
@@ -1079,6 +1083,7 @@ PAGE_STYLESHEET = """
   }
   .tooltip-anchor:hover .hover-tooltip,
   .tooltip-anchor:focus .hover-tooltip { opacity: 1; visibility: visible; }
+  .tooltip-align-right { left: auto; right: 0; }
   .tooltip-above { top: auto; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%); }
   .tooltip-light { background: var(--bg); color: var(--text); max-width: min(420px, 88vw); }
   .tooltip-line { display: block; }
@@ -1103,7 +1108,6 @@ PAGE_STYLESHEET = """
     .nav-links { gap: 1rem; font-size: 0.9rem; }
     .hero { padding: 2.5rem 1rem; }
     .section { padding: 2rem 1rem; }
-    .section-title { font-size: 1.6rem; }
     .panel { padding: 1rem 0.75rem; }
     .chart-title-row { grid-template-columns: 1fr; justify-items: center; }
     .chart-title, .cause-reset-btn { grid-column: 1; justify-self: center; }
@@ -1114,18 +1118,20 @@ PAGE_STYLESHEET = """
 def _render_page(
     page_title: str,
     heading: str,
-    lead: str,
+    lead: str | None,
     current_page: str,
     body_html: str,
     generated_at: datetime,
 ) -> str:
-    """Wrap a page body in the shared Sazon-styled header, hero and footer."""
+    """Wrap a page body in the shared Sazon-styled header, hero and footer.
+    The hero subtitle is omitted when `lead` is None."""
     current_marker = ' aria-current="page"'
     navigation_links = "".join(
         f'<li><a href="{file_name}"{current_marker if file_name == current_page else ""}>'
         f"{html.escape(label)}</a></li>"
         for file_name, label in SITE_PAGES
     )
+    lead_markup = f"<p>{html.escape(lead)}</p>" if lead else ""
     source_lines = "".join(
         f'<span class="tooltip-line">{html.escape(line)}</span>'
         for line in SOURCE_NOTES
@@ -1153,7 +1159,7 @@ def _render_page(
 <main>
   <section class="hero">
     <h1>{html.escape(heading)}</h1>
-    <p>{html.escape(lead)}</p>
+    {lead_markup}
   </section>
   <div class="section">{body_html}</div>
 </main>
@@ -1192,16 +1198,13 @@ def build_main_page_html(
     snapshot_timestamps: list[datetime],
     generated_at: datetime,
 ) -> str:
-    """The interactive customers-out page, linking to the indices page."""
+    """The interactive customers-out page."""
     body_html = f"""
-    <div class="panel">{build_customers_out_section(hourly_points_by_cause, daily_points_by_cause, snapshot_timestamps, generated_at)}</div>
-    <div class="cta-row">
-      <a class="cta-button" href="{INDICES_PAGE_FILE_NAME}">View reliability indices →</a>
-    </div>"""
+    <div class="panel">{build_customers_out_section(hourly_points_by_cause, daily_points_by_cause, snapshot_timestamps, generated_at)}</div>"""
     return _render_page(
         page_title="Puerto Rico Grid Reliability",
-        heading="Puerto Rico Grid Reliability",
-        lead="Count of LUMA PR customers without service",
+        heading="Puerto Rico / LUMA Energy Historic Customer Outage Statistics",
+        lead=None,
         current_page=MAIN_PAGE_FILE_NAME,
         body_html=body_html,
         generated_at=generated_at,
@@ -1229,9 +1232,6 @@ def build_indices_page_html(
         coverage_sentence = "Awaiting the first full day of data."
 
     body_html = f"""
-    <a class="back-link" href="{MAIN_PAGE_FILE_NAME}">← Back to grid reliability</a>
-    <h2 class="section-title">Island-wide reliability</h2>
-    <p class="section-subtitle">{html.escape(coverage_sentence)}</p>
     {build_kpi_cards(summary)}
     <div class="panel">{build_outage_level_figure(hourly_points)}</div>
     <div class="panel">{build_customer_minutes_escalation_figure(hourly_points)}</div>
@@ -1260,7 +1260,7 @@ def build_indices_page_html(
     return _render_page(
         page_title="Reliability Indices",
         heading="Reliability Indices",
-        lead="IEEE 1366 measures of how often and how long Puerto Rico's grid leaves customers without power.",
+        lead=coverage_sentence,
         current_page=INDICES_PAGE_FILE_NAME,
         body_html=body_html,
         generated_at=generated_at,
