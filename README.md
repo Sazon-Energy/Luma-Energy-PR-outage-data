@@ -44,6 +44,12 @@ clock: it calls `collect.yml`'s `workflow_dispatch` API directly, which
 collection trigger" section of [`db/schema.sql`](db/schema.sql) for the
 mechanism, and step 2 of **One-time setup** below to enable it.
 
+`collect.yml` uses a concurrency group, so at most one collection run is
+running and one is waiting at any time. If GitHub Actions goes down, the
+dispatches that pile up during the outage cancel each other instead of all
+running (and failing) at once when it recovers. Cancelled runs don't send
+failure emails.
+
 The LUMA API sits behind an Incapsula WAF. A request with realistic browser
 headers usually passes; on the rare occasion it doesn't, the collection
 workflow falls back to loading the real status page in `browserless/chrome`

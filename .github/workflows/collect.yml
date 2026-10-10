@@ -21,9 +21,19 @@ on:
     - cron: '*/30 * * * *'
   workflow_dispatch:
 
+# At most one collection run pending at a time. Without this, a GitHub
+# Actions outage lets the Supabase pg_cron job's dispatches (or repeated
+# manual runs) pile up as a backlog that all release at once when GitHub
+# recovers; cancelled backlog runs don't send a notification email, only
+# genuine failures do.
+concurrency:
+  group: collect-luma-outage-snapshot
+  cancel-in-progress: false
+
 jobs:
   collect:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
