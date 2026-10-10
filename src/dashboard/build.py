@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 from datetime import date, datetime, timedelta, timezone
 
 import plotly.graph_objects as graph_objects
@@ -210,7 +211,7 @@ def _build_customers_out_figure(
         # The chart title lives in the HTML above the figure (see
         # `build_customers_out_section`) so it can sit centered as a label.
         yaxis_title="Customers out (hourly peak)",
-        xaxis=dict(title="Hour (Puerto Rico local time)", autorange="reversed"),
+        xaxis=dict(title="Hour (Puerto Rico local time)"),
         barmode="stack",
         legend=dict(orientation="h", y=1.1, x=0),
     )
@@ -434,16 +435,17 @@ def build_window_controls_script(
       // The window always spans exactly the active view's number of days -
       // the slider only pans which days are shown, it never changes that
       // span. offset counts days back from the most recent available day: 0
-      // is today (slider at the left); larger values move the window's near
-      // edge - the "first day" shown at the chart's left edge - into the
-      // past (slider moves right). Because the window length is fixed, the
+      // is today (slider at the right end, matching the chart, which reads
+      // oldest to newest left to right); larger values move the window into
+      // the past (slider moves left). Because the window length is fixed, the
       // slider's own range depends on the active view (a short window has
       // more valid positions than a long one).
       function applyView(offset) {{
         var length = activeView.days;
         var maxOffset = Math.max(0, availableDays - length);
         offset = Math.min(Math.max(offset, 0), maxOffset);
-        if (String(slider.value) !== String(offset)) slider.value = offset;
+        var sliderPosition = maxOffset - offset;
+        if (String(slider.value) !== String(sliderPosition)) slider.value = sliderPosition;
 
         var endIndex = availableDays - 1 - offset;
         var startIndex = Math.max(0, endIndex - length + 1);
@@ -458,10 +460,9 @@ def build_window_controls_script(
         if (activeView.granularity === 'hour') {{
           Plotly.relayout(figureDiv, {{
             'xaxis.autorange': false,
-            // range given newest-first so the most recent hour renders on the
-            // left; the upper bound is midnight after endDate so that day's
-            // hours are fully included.
-            'xaxis.range': [addDays(endDate, 1), startDate],
+            // the upper bound is midnight after endDate so that day's hours
+            // are fully included.
+            'xaxis.range': [startDate, addDays(endDate, 1)],
             'xaxis.title.text': 'Hour (Puerto Rico local time)',
             'yaxis.title.text': 'Customers out (hourly peak)',
             'yaxis.autorange': true
@@ -469,7 +470,7 @@ def build_window_controls_script(
         }} else {{
           Plotly.relayout(figureDiv, {{
             'xaxis.autorange': false,
-            'xaxis.range': [endDate, startDate],
+            'xaxis.range': [startDate, endDate],
             'xaxis.title.text': 'Day (Puerto Rico local time)',
             'yaxis.title.text': 'Customers out (daily peak)',
             'yaxis.autorange': true
@@ -488,14 +489,16 @@ def build_window_controls_script(
         var maxOffset = Math.max(0, availableDays - length);
         slider.min = 0;
         slider.max = maxOffset;
-        slider.value = 0;
+        slider.value = maxOffset;
         slider.disabled = availableDays === 0;
 
+        // Each position is labelled with the first day its window shows.
         startDateOptions.innerHTML = '';
-        for (var startOffset = 0; startOffset <= maxOffset; startOffset++) {{
+        for (var sliderPosition = 0; sliderPosition <= maxOffset; sliderPosition++) {{
+          var windowEndIndex = availableDays - 1 - (maxOffset - sliderPosition);
           var option = document.createElement('option');
-          option.value = startOffset;
-          option.label = formatDate(dailyData.dates[availableDays - 1 - startOffset]);
+          option.value = sliderPosition;
+          option.label = formatDate(dailyData.dates[Math.max(0, windowEndIndex - length + 1)]);
           startDateOptions.appendChild(option);
         }}
       }}
@@ -510,7 +513,7 @@ def build_window_controls_script(
       }});
 
       slider.addEventListener('input', function() {{
-        applyView(parseInt(slider.value, 10));
+        applyView(parseInt(slider.max, 10) - parseInt(slider.value, 10));
       }});
 
       causeResetButton.addEventListener('click', function() {{
@@ -780,6 +783,23 @@ def build_region_comparison_figure(region_daily_points: list[MetricPoint]) -> st
     return _figure_to_html(figure)
 
 
+def _most_recent_consecutive_days(daily_points: list[MetricPoint]) -> list[datetime]:
+    """Period starts of the unbroken run of days (Puerto Rico local dates)
+    ending at the latest day with data."""
+    local_period_starts = [
+        (point.period_start.astimezone(PUERTO_RICO_TIMEZONE).date(), point.period_start)
+        for point in daily_points
+    ]
+    consecutive_run: list[datetime] = []
+    for local_date, period_start in reversed(local_period_starts):
+        if consecutive_run:
+            earliest_local_date = consecutive_run[0].astimezone(PUERTO_RICO_TIMEZONE).date()
+            if earliest_local_date - local_date != timedelta(days=1):
+                break
+        consecutive_run.insert(0, period_start)
+    return consecutive_run
+
+
 def summarize_window(points: list[MetricPoint], window_days: int | None = None) -> dict:
     """Aggregate daily rows into headline figures.
 
@@ -826,6 +846,41 @@ def _format_metric(value: float | None, suffix: str, decimals: int = 2) -> str:
     return f"{value:,.{decimals}f}<span class='metric-suffix'>{suffix}</span>"
 
 
+def _metric_descriptor(text: str) -> str:
+    """Smaller line beneath a KPI value, saying what the number counts."""
+    return f'<span class="metric-secondary">{html.escape(text)}</span>'
+
+
+def _round_down(value: float | None, decimals: int) -> float | None:
+    """Truncate toward zero, so an availability figure is never shown rounded
+    up (99.996% must not display as 100.00%)."""
+    if value is None:
+        return None
+    scale = 10 ** decimals
+    return math.floor(value * scale) / scale
+
+
+def _round_up(value: float | None, decimals: int) -> float | None:
+    """Round away from zero at `decimals`, so outage figures are never shown
+    understated. The inner round() absorbs float noise (2.5 * 10 can come out
+    as 25.000000000000004, which would otherwise ceil to 2.6)."""
+    if value is None:
+        return None
+    scale = 10 ** decimals
+    return math.ceil(round(value * scale, 9)) / scale
+
+
+def _format_minutes_with_hours(value: float | None) -> str:
+    """Whole minutes, rounded up so outage time is never understated, with
+    the same value in hours beneath it."""
+    if value is None:
+        return _format_metric(None, " min")
+    return (
+        _format_metric(math.ceil(value), " min", 0)
+        + _metric_descriptor(f"{value / 60:,.1f} hours")
+    )
+
+
 def _format_local_date(moment: datetime) -> str:
     local_date = moment.astimezone(PUERTO_RICO_TIMEZONE).date()
     return f"{local_date:%b} {local_date.day}, {local_date.year}"
@@ -837,36 +892,40 @@ def build_kpi_cards(summary: dict) -> str:
             "saidi",
             "SAIDI",
             "System Average Interruption Duration Index",
-            _format_metric(summary["saidi"], " min"),
+            _format_minutes_with_hours(summary["saidi"]),
             "Minutes of interruption per customer served",
-            "solid",
+            False,
         ),
         (
             "saifi",
             "SAIFI",
             "System Average Interruption Frequency Index",
-            _format_metric(summary["saifi"], "", 4),
-            "Interruptions per customer — lower bound",
-            "estimated",
+            _format_metric(_round_up(summary["saifi"], 1), "", 1) + _metric_descriptor("interruptions"),
+            "Number of interruptions per customer — lower bound",
+            True,
         ),
         (
             "caidi",
             "CAIDI",
             "Customer Average Interruption Duration Index",
-            _format_metric(summary["caidi"], " min", 1),
+            _format_minutes_with_hours(summary["caidi"]),
             "Average restoration time — upper bound",
-            "estimated",
+            True,
         ),
         (
             "asai",
             "ASAI",
             "Average Service Availability Index",
-            _format_metric(summary["asai"], " %", 4),
-            "Service availability",
-            "solid",
+            _format_metric(_round_down(summary["asai"], 2), " %", 2)
+            + _metric_descriptor("effective uptime"),
+            "Percentage of time that power is available.",
+            False,
         ),
     ]
 
+    # Snapshot sampling can only bound these, however much history accumulates;
+    # see the "How to read these numbers" panel.
+    estimated_marker = ' <em class="kpi-estimated">Estimated</em>'
     card_markup = "".join(
         f"""
         <div class="kpi-card">
@@ -875,14 +934,21 @@ def build_kpi_cards(summary: dict) -> str:
               {name}
               <span class="hover-tooltip" id="kpi-{slug}-full-name" role="tooltip">{html.escape(full_name)}</span>
             </span>
-            <span class="status-badge status-{quality}"><span class="status-dot"></span>{quality}</span>
           </div>
           <div class="kpi-value">{value}</div>
-          <div class="kpi-note">{html.escape(note)}</div>
+          <div class="kpi-note">{html.escape(note)}{estimated_marker if is_estimated else ""}</div>
         </div>"""
-        for slug, name, full_name, value, note, quality in cards
+        for slug, name, full_name, value, note, is_estimated in cards
     )
     return f'<div class="kpi-grid">{card_markup}</div>'
+
+
+def _status_badge(quality: str, label: str) -> str:
+    """Small pill matching the KPI cards' status badges, as trusted HTML."""
+    return (
+        f'<span class="status-badge status-{quality}">'
+        f'<span class="status-dot"></span>{html.escape(label)}</span>'
+    )
 
 
 def _major_event_day_note(major_event_days: list[MajorEventDayPoint]) -> str:
@@ -1023,20 +1089,35 @@ PAGE_STYLESHEET = """
   .cause-reset-btn[hidden] { display: none; }
 
   /* KPI cards */
+  .data-range-note {
+    text-align: center; font-size: 0.85rem; color: var(--muted); margin-bottom: 1.25rem;
+  }
   .kpi-grid { display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
   .kpi-card {
-    background: var(--bg); border: 1px solid var(--border); border-radius: 15px;
-    box-shadow: var(--shadow); padding: 1.5rem;
+    display: flex; flex-direction: column; align-items: center; text-align: center;
+    background: var(--bg); border: 1px solid var(--border); border-top: 4px solid var(--primary);
+    border-radius: 15px; box-shadow: var(--shadow); padding: 1.5rem 1.25rem 1.25rem;
   }
-  .kpi-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .kpi-name { font-weight: 700; font-size: 1rem; color: var(--secondary); }
+  .kpi-header { display: flex; justify-content: center; }
+  .kpi-name {
+    font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.12em;
+    color: var(--muted);
+  }
+  /* Centered under the name rather than hanging off its left edge. */
+  .kpi-name .hover-tooltip { left: 50%; transform: translateX(-50%); }
   .kpi-value {
-    font-size: 2rem; font-weight: 700; color: var(--secondary); margin: 0.5rem 0 0.25rem;
-    letter-spacing: -0.02em; font-variant-numeric: tabular-nums;
+    font-size: 2.75rem; font-weight: 700; color: var(--secondary); line-height: 1.1;
+    margin: 0.6rem 0 0.75rem; letter-spacing: -0.03em; font-variant-numeric: tabular-nums;
   }
-  .metric-suffix { font-size: 0.95rem; font-weight: 500; color: var(--muted); margin-left: 3px; }
+  .metric-suffix { font-size: 1rem; font-weight: 500; color: var(--muted); margin-left: 4px; letter-spacing: 0; }
   .metric-empty { color: var(--muted); }
-  .kpi-note { font-size: 0.85rem; color: var(--muted); }
+  .metric-secondary {
+    display: block; margin-top: 0.3rem; font-size: 0.95rem; font-weight: 500;
+    color: var(--muted); letter-spacing: 0;
+  }
+  /* Pinned to the bottom so notes line up across cards of different heights. */
+  .kpi-note { margin-top: auto; font-size: 0.85rem; color: var(--muted); line-height: 1.45; }
+  .kpi-estimated { display: block; color: #b45309; font-weight: 600; }
   .status-badge {
     display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0.65rem;
     border-radius: 20px; font-size: 0.68rem; font-weight: 600;
@@ -1065,6 +1146,30 @@ PAGE_STYLESHEET = """
   .callout li { margin-bottom: 0.35rem; }
   .callout strong { color: var(--text); }
   .callout .callout-note { margin-top: 0.75rem; }
+  .callout h4 {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem;
+    color: var(--secondary); font-size: 1rem; margin: 1.5rem 0 0.35rem;
+  }
+  .callout .expert-note {
+    margin-top: 0.4rem; padding-left: 0.85rem; border-left: 2px solid var(--border);
+    font-size: 0.85rem; line-height: 1.6;
+  }
+  .callout-table {
+    width: 100%; border-collapse: collapse; margin-top: 0.75rem; font-size: 0.88rem;
+  }
+  .callout-table th, .callout-table td {
+    text-align: left; padding: 0.45rem 0.75rem; border-bottom: 1px solid var(--border);
+  }
+  .callout-table th {
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--secondary);
+  }
+  .callout-table td:first-child { color: var(--text); font-weight: 600; }
+  .status-unavailable {
+    background: rgba(107, 114, 128, 0.1); color: var(--muted);
+    border: 1px solid rgba(107, 114, 128, 0.2);
+  }
+  .status-unavailable .status-dot { background: var(--muted); }
 
   /* Tooltips: put `tooltip-anchor` on the element and a `hover-tooltip`
      child inside it. Opens below by default; `tooltip-above` flips it. */
@@ -1111,6 +1216,16 @@ PAGE_STYLESHEET = """
     .panel { padding: 1rem 0.75rem; }
     .chart-title-row { grid-template-columns: 1fr; justify-items: center; }
     .chart-title, .cause-reset-btn { grid-column: 1; justify-self: center; }
+    .callout { padding: 1.25rem 1rem; }
+    /* Stack each table row into a labelled block on narrow screens. */
+    .callout-table thead { display: none; }
+    .callout-table, .callout-table tbody, .callout-table tr, .callout-table td { display: block; }
+    .callout-table tr { padding: 0.5rem 0; border-bottom: 1px solid var(--border); }
+    .callout-table td { border-bottom: none; padding: 0.15rem 0; }
+    .callout-table td::before {
+      content: attr(data-label) ": "; font-weight: 600; color: var(--secondary);
+    }
+    .callout-table td:first-child::before { content: none; }
   }
 """
 
@@ -1177,8 +1292,8 @@ def _render_page(
 MAIN_PAGE_FILE_NAME = "index.html"
 INDICES_PAGE_FILE_NAME = "indices.html"
 SITE_PAGES = [
-    (MAIN_PAGE_FILE_NAME, "Grid reliability"),
-    (INDICES_PAGE_FILE_NAME, "Reliability indices"),
+    (MAIN_PAGE_FILE_NAME, "Customer Outage"),
+    (INDICES_PAGE_FILE_NAME, "Reliability Indices"),
 ]
 
 # Shown in the footer's "Generated" tooltip on every page.
@@ -1202,9 +1317,9 @@ def build_main_page_html(
     body_html = f"""
     <div class="panel">{build_customers_out_section(hourly_points_by_cause, daily_points_by_cause, snapshot_timestamps, generated_at)}</div>"""
     return _render_page(
-        page_title="Puerto Rico Grid Reliability",
-        heading="Puerto Rico / LUMA Energy Historic Customer Outage Statistics",
-        lead=None,
+        page_title="Customer Outage Statistics",
+        heading="Customer Outage Statistics",
+        lead="Puerto Rico/LUMA Energy historic customer outage statistics",
         current_page=MAIN_PAGE_FILE_NAME,
         body_html=body_html,
         generated_at=generated_at,
@@ -1221,17 +1336,20 @@ def build_indices_page_html(
     """Static page: headline indices, supporting charts and how to read them,
     always over all data available up to one year - no selectors."""
     summary = summarize_window(daily_points, window_days=MAXIMUM_HISTORY_DAYS)
-    if summary["days"]:
+    consecutive_run = _most_recent_consecutive_days(daily_points)
+    if consecutive_run:
+        run_day_count = len(consecutive_run)
         coverage_sentence = (
-            f"All data available, up to one year: "
-            f"{_format_local_date(summary['first_period_start'])} – "
-            f"{_format_local_date(summary['last_period_start'])} "
-            f"({summary['days']} day{'s' if summary['days'] != 1 else ''})"
+            f"Indices require 1 year of data for accurate calculation. "
+            f"Currently {run_day_count} consecutive day{'s' if run_day_count != 1 else ''} "
+            f"available. {_format_local_date(consecutive_run[0])} – "
+            f"{_format_local_date(consecutive_run[-1])}"
         )
     else:
         coverage_sentence = "Awaiting the first full day of data."
 
     body_html = f"""
+    <p class="data-range-note">{html.escape(coverage_sentence)}</p>
     {build_kpi_cards(summary)}
     <div class="panel">{build_outage_level_figure(hourly_points)}</div>
     <div class="panel">{build_customer_minutes_escalation_figure(hourly_points)}</div>
@@ -1241,26 +1359,125 @@ def build_indices_page_html(
 
     <div class="callout">
       <h3>How to read these numbers</h3>
+
+      <h4>Where the data comes from</h4>
       <p>
-        The source publishes how many customers are out at a point in time, not an
-        interruption event log. That makes some indices exact and others bounded:
+        About every 10 minutes, LUMA publishes one number: how many customers are
+        without power right now. We record that number each time, like taking a
+        snapshot every 10 minutes. Snapshots show how many people are in the dark
+        at each moment. They can't show individual outages: which homes went out,
+        exactly when, or when each one came back.
       </p>
-      <ul>
-        <li><strong>SAIDI, ASAI and customer-minutes are well supported</strong> —
-            they integrate the customers-out curve, which sampled data measures directly.</li>
-        <li><strong>SAIFI is a lower bound.</strong> It is inferred from rising
-            edges, so any outage that begins and ends between two samples is invisible.</li>
-        <li><strong>CAIDI is an upper bound</strong>, since it divides SAIDI by the
-            understated SAIFI. It is the customer-weighted average restoration time.</li>
-        <li><strong>MAIFI (momentary interruptions) is not reported</strong> — it is
-            undetectable at a 10-minute sampling interval.</li>
-      </ul>
+
+      <h4>What an interruption event log is</h4>
+      <p>
+        Internally, a utility keeps a record of every outage: when it started, which
+        customers it affected, and when each was restored. Official reliability
+        reports are calculated from that log. LUMA doesn't publish it in real time,
+        so every number on this page is calculated from the snapshots instead. Some
+        numbers come out very close to what the event log would give; others can
+        only be a best estimate:
+      </p>
+      <table class="callout-table">
+        <thead>
+          <tr><th>Measure</th><th>From snapshots</th><th>Exact value needs</th></tr>
+        </thead>
+        <tbody>
+          <tr><td data-label="Measure">SAIDI, ASAI, customer-minutes</td><td data-label="From snapshots">Reliable</td><td data-label="Exact value needs">Snapshots are enough</td></tr>
+          <tr><td data-label="Measure">SAIFI</td><td data-label="From snapshots">A minimum (the real number is likely higher)</td><td data-label="Exact value needs">Event log</td></tr>
+          <tr><td data-label="Measure">CAIDI</td><td data-label="From snapshots">A maximum (the real number is likely lower)</td><td data-label="Exact value needs">Event log</td></tr>
+          <tr><td data-label="Measure">MAIFI</td><td data-label="From snapshots">Can't be measured</td><td data-label="Exact value needs">Event log or meter data</td></tr>
+        </tbody>
+      </table>
+
+      <h4>SAIDI: average time without power {_status_badge("solid", "Reliable")}</h4>
+      <p>
+        Take all the time LUMA customers spent without power and share it out evenly
+        across every customer. SAIDI is how many minutes each customer would get. For
+        example, a SAIDI of 600 minutes means the average customer went about 10 hours
+        without power over the period shown. Snapshots measure this well, because
+        adding up time without power doesn't require knowing which outage was which.
+      </p>
+      <p class="expert-note">
+        <strong>For experts:</strong> Σ customer-minutes ÷ average customers served.
+        Customer-minutes are found by trapezoidal integration between samples up to
+        35 minutes apart. Longer gaps are skipped, not interpolated, so missed
+        collections slightly understate SAIDI. The headline figure is the sum of daily
+        SAIDI over the period shown, not an annual number, and it includes planned
+        outages and Major Event Days. Official IEEE 1366 reports usually exclude both,
+        so don't compare it directly with LUMA's or the regulator's filings.
+      </p>
+
+      <h4>SAIFI: how often the average customer lost power {_status_badge("estimated", "A minimum")}</h4>
+      <p>
+        A SAIFI of 1.5 means the typical customer lost power about one and a half
+        times. Ours is a floor. If an outage starts and ends between two snapshots, we
+        never see it. And if one neighborhood is restored at the same moment another
+        goes dark, the total doesn't change, so the new outage goes uncounted.
+      </p>
+      <p class="expert-note">
+        <strong>For experts:</strong> Σ of positive increases in customers-out between
+        consecutive samples ÷ customers served. It only sees net change, so overlapping
+        restorations hide new interruptions, and outages shorter than the sampling
+        interval can't be detected. That makes this a strict lower bound. An exact
+        count needs the per-customer interruption log.
+      </p>
+
+      <h4>CAIDI: how long an outage typically lasts {_status_badge("estimated", "A maximum")}</h4>
+      <p>
+        When a customer does lose power, this is roughly how long it takes on average
+        to get it back. Ours probably runs high: the short outages we can't see would
+        pull the average down if we could count them.
+      </p>
+      <p class="expert-note">
+        <strong>For experts:</strong> CAIDI = SAIDI ÷ SAIFI, the customer-weighted mean
+        restoration time. The SAIDI on top is reliable, but SAIFI underneath is biased
+        low, so CAIDI is biased high (an upper bound).
+      </p>
+
+      <h4>ASAI: share of time the power was on {_status_badge("solid", "Reliable")}</h4>
+      <p>
+        The percentage of time the average customer had power. Small differences
+        matter: 99.9% sounds nearly perfect, but over a year it adds up to almost
+        9 hours without power.
+      </p>
+      <p class="expert-note">
+        <strong>For experts:</strong> ASAI = 1 − SAIDI ÷ minutes in the period. It
+        inherits SAIDI's reliability and its small understatement from collection gaps.
+      </p>
+
+      <h4>MAIFI: brief flickers {_status_badge("unavailable", "Not shown")}</h4>
+      <p>
+        Counts momentary interruptions: the lights blink off, then come straight back.
+        These last seconds, so 10-minute snapshots can't see them.
+      </p>
+      <p class="expert-note">
+        <strong>For experts:</strong> IEEE 1366 treats interruptions under 5 minutes as
+        momentary. Measuring them takes recloser or meter event data.
+      </p>
+
+      <h4>Major Event Days: separating disasters from everyday service</h4>
+      <p>
+        A hurricane or island-wide blackout can cause more outage time in one day than
+        months of normal operation. The standard flags those days (red bars in the
+        daily SAIDI chart) so extraordinary events can be looked at separately from
+        day-to-day reliability. The cutoff is set from the history so far, so it will
+        shift as more data comes in. The standard uses five years of history.
+      </p>
+      <p class="expert-note">
+        <strong>For experts:</strong> IEEE 1366 2.5 Beta Method:
+        T<sub>MED</sub> = exp(α + 2.5β), where α and β are the mean and sample standard
+        deviation of ln(daily SAIDI), leaving out days with zero SAIDI. We start
+        computing it once there are 30 days of history, and it's labelled provisional
+        until there are five years. The headline cards above are <strong>not</strong>
+        MED-normalized.
+      </p>
       <p class="callout-note">{_major_event_day_note(major_event_days)}</p>
     </div>"""
     return _render_page(
         page_title="Reliability Indices",
         heading="Reliability Indices",
-        lead=coverage_sentence,
+        lead="Puerto Rico/LUMA Energy estimated reliability indices",
         current_page=INDICES_PAGE_FILE_NAME,
         body_html=body_html,
         generated_at=generated_at,
