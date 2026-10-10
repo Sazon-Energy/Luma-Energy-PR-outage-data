@@ -1,6 +1,9 @@
 # macOS
 .DS_Store
 
+# Claude Code local session/runtime state
+.claude/
+
 # Secrets
 .env
 
@@ -14,3 +17,4 @@ venv/
 # Generated dashboard output (built by src/dashboard, deployed to Pages
 # straight from the workflow - never committed)
 /site/
+/Manual data snapshots
