@@ -20,6 +20,15 @@ on:
     # GitHub never reliably honored the tighter interval anyway.
     - cron: '*/30 * * * *'
   workflow_dispatch:
+    inputs:
+      # Lets the headless-browser fallback below be exercised on demand
+      # (e.g. `gh workflow run collect.yml -f force_browserless_fallback=true`)
+      # instead of waiting for a real WAF block. The pg_cron dispatch sends
+      # no inputs, so scheduled runs are unaffected.
+      force_browserless_fallback:
+        description: Run the browserless fallback even if the direct scrape succeeds
+        type: boolean
+        default: false
 
 # At most one collection run pending at a time. Without this, a GitHub
 # Actions outage lets the Supabase pg_cron job's dispatches (or repeated
@@ -60,6 +69,20 @@ jobs:
           echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
           exit "$exit_code"
 
+      # The fallback runs on a WAF block (exit code 2), or when forced via the
+      # workflow_dispatch input - but only on top of a successful direct
+      # scrape, never a genuine (non-WAF) error, which it couldn't fix.
+      - name: Decide whether to use the browserless fallback
+        id: fallback
+        run: |
+          scrape_exit_code='${{ steps.scrape.outputs.exit_code }}'
+          force_fallback='${{ inputs.force_browserless_fallback }}'
+          if [ "$scrape_exit_code" = '2' ] || { [ "$force_fallback" = 'true' ] && [ "$scrape_exit_code" = '0' ]; }; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # The LUMA outage API sits behind an Incapsula WAF that occasionally
       # blocks direct requests even with browser-like headers. When that
       # happens, fall back to loading the real status page in a headless
@@ -67,7 +90,7 @@ jobs:
       # which passes the WAF like any other browser visit. This mirrors the
       # approach proven by https://github.com/jpadilla/tracking-luma-outages.
       - name: Run browserless
-        if: steps.scrape.outputs.exit_code == '2'
+        if: steps.fallback.outputs.needed == 'true'
         run: |
           docker run -d \
             --name browserless \
@@ -75,33 +98,69 @@ jobs:
             -e "MAX_CONCURRENT_SESSIONS=1" \
             -e "QUEUE_LENGTH=0" \
             browserless/chrome
-          sleep 5
+          # Wait until browserless actually answers HTTP rather than sleeping
+          # a fixed time, so the first capture isn't sent to a container
+          # that's still starting up.
+          for readiness_check in $(seq 1 30); do
+            if curl --silent --output /dev/null http://localhost:3000/; then
+              echo "browserless ready after ${readiness_check}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::warning::browserless did not answer within 30s; trying the capture anyway."
 
+      # The page-side logic lives in scripts/capture_region_snapshot.js; jq
+      # wraps it as the {"code": ...} body browserless's /function endpoint
+      # expects. Each attempt is checked right away, and the step stops at the
+      # first one that yields real JSON without a captureError - so one slow
+      # or flaky page load doesn't fail the whole run. Whatever the last
+      # attempt produced is left for the Validate step below to judge.
       - name: Capture region snapshot via browserless
-        if: steps.scrape.outputs.exit_code == '2'
+        if: steps.fallback.outputs.needed == 'true'
         run: |
-          curl -s --request POST \
-            --url http://localhost:3000/function \
-            --header 'Content-Type: application/json' \
-            --data '{"code": "module.exports=async({page})=>{await page.goto(\"https://miluma.lumapr.com/outages/serviceStatus\");const xhrResponse=await page.waitForResponse(r=>r.request().url().includes(\"/outage/regionsWithoutService\")&&r.request().method()===\"GET\");const xhrPayload=await xhrResponse.json();return{data:xhrPayload,type:\"application/json\"}};"}' \
-            --output /tmp/clients_without_service.json
-          cat /tmp/clients_without_service.json
+          capture_max_attempts=3
+          capture_retry_delay_seconds=10
+          jq --raw-input --slurp '{code: .}' scripts/capture_region_snapshot.js > /tmp/browserless_request.json
+          for capture_attempt in $(seq 1 "$capture_max_attempts"); do
+            curl --silent --max-time 90 --request POST \
+              --url http://localhost:3000/function \
+              --header 'Content-Type: application/json' \
+              --data @/tmp/browserless_request.json \
+              --output /tmp/clients_without_service.json || true
+            if jq --exit-status 'type == "object" and (has("captureError") | not)' /tmp/clients_without_service.json > /dev/null 2>&1; then
+              echo "captured region snapshot on attempt $capture_attempt/$capture_max_attempts"
+              cat /tmp/clients_without_service.json
+              exit 0
+            fi
+            echo "::warning::browserless capture attempt $capture_attempt/$capture_max_attempts failed; response:"
+            cat /tmp/clients_without_service.json 2>/dev/null || echo "(no response body)"
+            echo
+            if [ "$capture_attempt" -lt "$capture_max_attempts" ]; then
+              sleep "$capture_retry_delay_seconds"
+            fi
+          done
 
-      # browserless returns plain error text (e.g. a Puppeteer navigation or
-      # waitForResponse timeout) instead of JSON when the capture itself
-      # fails, and the step above writes whatever it gets without checking.
-      # Left unvalidated, that surfaces two steps later as a confusing
-      # Python JSONDecodeError instead of a clear cause - fail fast here.
+      # Fails fast with a clear cause if every capture attempt above failed,
+      # rather than letting it surface two steps later as a confusing Python
+      # JSONDecodeError or KeyError. A failed capture is either plain error
+      # text from browserless or the JSON diagnostics (captureError, pageUrl,
+      # pageTitle, pageContentStart) from scripts/capture_region_snapshot.js -
+      # a WAF challenge page shows up there as an Incapsula title/content.
       - name: Validate browserless capture
-        if: steps.scrape.outputs.exit_code == '2'
+        if: steps.fallback.outputs.needed == 'true'
         run: |
           if ! jq empty /tmp/clients_without_service.json 2>/dev/null; then
-            echo "::error::browserless did not return valid JSON - see the 'Capture region snapshot via browserless' step's output above for the actual response (likely a Puppeteer timeout or navigation error)."
+            echo "::error::browserless did not return valid JSON - see the 'Capture region snapshot via browserless' step's output above for the actual response."
+            exit 1
+          fi
+          if jq --exit-status 'has("captureError")' /tmp/clients_without_service.json > /dev/null 2>&1; then
+            echo "::error::browserless capture failed: $(jq --raw-output '.captureError' /tmp/clients_without_service.json) (page title: $(jq --raw-output '.pageTitle' /tmp/clients_without_service.json)) - see the 'Capture region snapshot via browserless' step's output above for the full diagnostics."
             exit 1
           fi
 
       - name: Scrape using captured snapshot
-        if: steps.scrape.outputs.exit_code == '2'
+        if: steps.fallback.outputs.needed == 'true'
         run: python -m src
         env:
           CLIENTS_WITHOUT_SERVICE_FILE: /tmp/clients_without_service.json
