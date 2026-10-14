@@ -17,6 +17,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import plotly.graph_objects as graph_objects
 import plotly.io as plotly_io
+from plotly.subplots import make_subplots
 
 from src.dashboard.data import MajorEventDayPoint, MetricPoint
 from src.metrics.reliability import PUERTO_RICO_TIMEZONE
@@ -67,9 +68,39 @@ VIEW_OPTIONS = [
     {"label": "60 d", "days": 60, "granularity": "day"},
     {"label": "90 d", "days": 90, "granularity": "day"},
 ]
-DEFAULT_VIEW_INDEX = 0
+# The page always opens on "60 d" showing the most recent 60 days; view and
+# start-date choices are never remembered between visits.
+DEFAULT_VIEW_INDEX = 2
+DEFAULT_GRANULARITY = VIEW_OPTIONS[DEFAULT_VIEW_INDEX]["granularity"]
 
 CUSTOMERS_OUT_FIGURE_DIV_ID = "customers-out-figure"
+
+
+# One-to-three-word meanings shown in the key under each chart, so readers new
+# to reliability indices can tell what each term measures. Charts pick the
+# entries they use; the wording stays the same everywhere.
+TERM_SUMMARIES = {
+    "SAIDI": "Minutes without power",
+    "SAIFI": "Outages per customer",
+    "CAIDI": "Average restoration time",
+    "Major Event Day": "Extreme outage day",
+    "T_MED": "Major-event threshold",
+    "Mean": "Hourly average",
+    "Peak": "Hourly maximum",
+    "Unplanned": "Faults and damage",
+    "Planned": "Scheduled work",
+    "Load shed": "Deliberate supply cuts",
+}
+
+
+def _chart_key(terms: list[str]) -> str:
+    """A compact "term — meaning" row placed under a chart."""
+    key_items = "".join(
+        f'<span class="chart-key-item"><strong>{html.escape(term)}</strong> '
+        f"{html.escape(TERM_SUMMARIES[term])}</span>"
+        for term in terms
+    )
+    return f'<div class="chart-key" role="note" aria-label="Chart key">{key_items}</div>'
 
 
 def _figure_to_html(
@@ -77,7 +108,7 @@ def _figure_to_html(
     div_id: str | None = None,
     margin_top: int = 48,
     height: int = 380,
-    allow_selection: bool = False,
+    allow_legend_toggle: bool = False,
 ) -> str:
     figure.update_layout(
         template=PLOTLY_TEMPLATE,
@@ -87,15 +118,16 @@ def _figure_to_html(
         font=dict(family=FONT_FAMILY, color="#1f2937"),
         title_font=dict(size=15, color="#1e293b"),
     )
-    if not allow_selection:
-        # Hover read-outs stay, but legend toggling and zoom are switched off
-        # so these charts always show the full period, exactly as published.
+    # Hover read-outs stay, but zoom is switched off so charts always show
+    # the period chosen for them. Ranges set from code (Plotly.relayout) still
+    # apply; fixedrange only blocks drag and scroll zoom.
+    figure.update_layout(dragmode=False)
+    figure.update_xaxes(fixedrange=True)
+    figure.update_yaxes(fixedrange=True)
+    if not allow_legend_toggle:
         figure.update_layout(
-            dragmode=False,
             legend=dict(itemclick=False, itemdoubleclick=False),
         )
-        figure.update_xaxes(fixedrange=True)
-        figure.update_yaxes(fixedrange=True)
     extra_kwargs = {"div_id": div_id} if div_id else {}
     return plotly_io.to_html(
         figure,
@@ -191,7 +223,7 @@ def _build_customers_out_figure(
                 y=_customers_out_series(hourly_points_by_cause[cause_basis], hourly_axis),
                 name=label,
                 marker_color=color,
-                visible=True,
+                visible=DEFAULT_GRANULARITY == "hour",
                 hovertemplate="%{y:,.0f} customers (peak)<extra>" + label + "</extra>",
             )
         )
@@ -202,7 +234,7 @@ def _build_customers_out_figure(
                 y=_customers_out_series(daily_points_by_cause[cause_basis], daily_axis),
                 name=label,
                 marker_color=color,
-                visible=False,
+                visible=DEFAULT_GRANULARITY == "day",
                 hovertemplate="%{y:,.0f} customers (peak)<extra>" + label + "</extra>",
             )
         )
@@ -210,8 +242,18 @@ def _build_customers_out_figure(
     figure.update_layout(
         # The chart title lives in the HTML above the figure (see
         # `build_customers_out_section`) so it can sit centered as a label.
-        yaxis_title="Customers out (hourly peak)",
-        xaxis=dict(title="Hour (Puerto Rico local time)"),
+        yaxis_title=(
+            "Customers out (hourly peak)"
+            if DEFAULT_GRANULARITY == "hour"
+            else "Customers out (daily peak)"
+        ),
+        xaxis=dict(
+            title=(
+                "Hour (Puerto Rico local time)"
+                if DEFAULT_GRANULARITY == "hour"
+                else "Day (Puerto Rico local time)"
+            )
+        ),
         barmode="stack",
         legend=dict(orientation="h", y=1.1, x=0),
     )
@@ -290,7 +332,7 @@ def build_window_controls_markup(available_days: int) -> str:
       <div class="window-slider-row" id="window-slider-row">
         <label for="window-start-slider">Start date</label>
         <input type="range" id="window-start-slider" min="0" max="0" value="0"
-               step="1" list="window-start-dates" {slider_disabled}>
+               step="1" list="window-start-dates" autocomplete="off" {slider_disabled}>
         <datalist id="window-start-dates"></datalist>
       </div>
       <div class="chart-title-row">
@@ -527,8 +569,22 @@ def build_window_controls_script(
       // Legend clicks and double-clicks surface as restyle events.
       figureDiv.on('plotly_restyle', updateCauseResetButton);
 
-      configureSliderForView();
-      applyView(0);
+      // Always the default view over the most recent days - nothing chosen
+      // on an earlier visit carries over.
+      function resetToDefaultView() {{
+        activeView = viewOptions[{DEFAULT_VIEW_INDEX}];
+        setActiveButton(buttons[{DEFAULT_VIEW_INDEX}]);
+        configureSliderForView();
+        applyView(0);
+      }}
+
+      // Back/forward navigation can restore this page from the browser's
+      // cache with the previous selection intact; reset it there too.
+      window.addEventListener('pageshow', function(event) {{
+        if (event.persisted) resetToDefaultView();
+      }});
+
+      resetToDefaultView();
     }})();
     </script>"""
 
@@ -562,7 +618,7 @@ def build_customers_out_section(
         div_id=CUSTOMERS_OUT_FIGURE_DIV_ID,
         margin_top=40,
         height=400,
-        allow_selection=True,
+        allow_legend_toggle=True,
     )
 
     controls_html = build_window_controls_markup(len(daily_axis))
@@ -570,7 +626,9 @@ def build_customers_out_section(
         daily_axis, snapshot_timestamps, generated_at, len(shown_segments)
     )
 
-    return f"{controls_html}{figure_html}{script_html}"
+    key_html = _chart_key([label for _, label, _ in shown_segments])
+
+    return f"{controls_html}{figure_html}{key_html}{script_html}"
 
 
 def build_outage_level_figure(hourly_points: list[MetricPoint]) -> str:
@@ -608,7 +666,7 @@ def build_outage_level_figure(hourly_points: list[MetricPoint]) -> str:
         xaxis_title=None,
         legend=dict(orientation="h", y=1.12, x=0),
     )
-    return _figure_to_html(figure)
+    return _figure_to_html(figure) + _chart_key(["Mean", "Peak"])
 
 
 def build_daily_saidi_figure(
@@ -663,91 +721,109 @@ def build_daily_saidi_figure(
         yaxis_title="Minutes per customer",
         showlegend=False,
     )
-    return _figure_to_html(figure)
+    key_terms = ["SAIDI", "Major Event Day"] + (["T_MED"] if threshold is not None else [])
+    return _figure_to_html(figure) + _chart_key(key_terms)
 
 
 def build_index_trend_figure(daily_points: list[MetricPoint]) -> str:
-    """SAIFI and CAIDI together, with their opposing estimation biases labelled."""
+    """SAIFI and CAIDI in two stacked panels sharing the date axis.
+
+    Their scales differ by orders of magnitude (a fraction of an outage versus
+    minutes), so overlaying them on twin axes made both lines look erratic.
+    Each panel starts at zero so a quiet day reads as small, not as a swing.
+    """
     if not daily_points:
         return _empty_state("No daily data yet.")
 
     daily_points = _limit_to_recent_days(daily_points, MAXIMUM_HISTORY_DAYS)
-    figure = graph_objects.Figure()
+    period_starts = [point.period_start for point in daily_points]
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.14,
+        subplot_titles=("SAIFI (lower bound)", "CAIDI (upper bound)"),
+    )
     figure.add_trace(
         graph_objects.Scatter(
-            x=[point.period_start for point in daily_points],
+            x=period_starts,
             y=[point.saifi_estimated for point in daily_points],
             name="SAIFI (lower bound)",
             mode="lines+markers",
             line=dict(color=COLOR_PRIMARY, width=2),
-            hovertemplate="%{y:.4f} interruptions/customer<extra></extra>",
-        )
+            hovertemplate="%{y:.4f} interruptions/customer<extra>SAIFI</extra>",
+        ),
+        row=1,
+        col=1,
     )
     figure.add_trace(
         graph_objects.Scatter(
-            x=[point.period_start for point in daily_points],
+            x=period_starts,
             y=[point.caidi_minutes for point in daily_points],
             name="CAIDI (upper bound)",
             mode="lines+markers",
             line=dict(color=COLOR_ACCENT, width=2),
-            yaxis="y2",
-            hovertemplate="%{y:.1f} min<extra></extra>",
-        )
+            hovertemplate="%{y:.1f} min<extra>CAIDI</extra>",
+        ),
+        row=2,
+        col=1,
     )
-    figure.update_layout(
-        title="SAIFI and CAIDI (daily)",
-        yaxis=dict(title="SAIFI"),
-        yaxis2=dict(title="CAIDI (min)", overlaying="y", side="right", showgrid=False),
-        legend=dict(orientation="h", y=1.12, x=0),
+    figure.update_yaxes(title_text="Per customer", rangemode="tozero", row=1, col=1)
+    figure.update_yaxes(title_text="Minutes", rangemode="tozero", row=2, col=1)
+    figure.update_annotations(font=dict(size=13, color="#1e293b"))
+    figure.update_layout(title="SAIFI and CAIDI (daily)", showlegend=False)
+    return _figure_to_html(figure, margin_top=72, height=520) + _chart_key(
+        ["SAIFI", "CAIDI"]
     )
-    return _figure_to_html(figure)
 
 
-def build_customer_minutes_escalation_figure(hourly_points: list[MetricPoint]) -> str:
-    """Cumulative customer-minutes, over as much history as is available.
+def build_cumulative_saidi_figure(daily_points: list[MetricPoint]) -> str:
+    """Running total of daily SAIDI - minutes without power per customer so far.
 
-    This is the emergency-response view: how fast customer-minutes are piling
-    up during an active storm or heatwave.
+    Utilities track year-to-date SAIDI this way against an annual target. The
+    days counted match `summarize_window`, so the line ends on the SAIDI card.
     """
-    if not hourly_points:
-        return _empty_state("No hourly data collected yet.")
+    if not daily_points:
+        return _empty_state("No daily data yet - SAIDI appears after a full day.")
 
-    recent_points = _limit_to_recent_days(hourly_points, MAXIMUM_HISTORY_DAYS)
-    span_days = (recent_points[-1].period_start - recent_points[0].period_start).days
-    running_total = 0.0
-    cumulative_values = []
-    for point in recent_points:
-        running_total += point.customer_minutes_interrupted
-        cumulative_values.append(running_total)
+    cutoff = daily_points[-1].period_start - timedelta(days=MAXIMUM_HISTORY_DAYS)
+    counted_points = [point for point in daily_points if point.period_start > cutoff]
+
+    running_saidi = 0.0
+    running_customer_minutes = 0.0
+    cumulative_saidi_values = []
+    hover_details = []
+    for point in counted_points:
+        running_saidi += point.saidi_minutes
+        running_customer_minutes += point.customer_minutes_interrupted
+        cumulative_saidi_values.append(running_saidi)
+        hover_details.append([point.saidi_minutes, running_customer_minutes])
 
     figure = graph_objects.Figure()
     figure.add_trace(
-        graph_objects.Bar(
-            x=[point.period_start for point in recent_points],
-            y=[point.customer_minutes_interrupted for point in recent_points],
-            name="Customer-minutes per hour",
-            marker_color=COLOR_PRIMARY_BAR,
-            hovertemplate="%{y:,.0f} customer-min<extra>this hour</extra>",
-        )
-    )
-    figure.add_trace(
         graph_objects.Scatter(
-            x=[point.period_start for point in recent_points],
-            y=cumulative_values,
-            name="Cumulative",
+            x=[point.period_start for point in counted_points],
+            y=cumulative_saidi_values,
+            customdata=hover_details,
+            name="Cumulative SAIDI",
             mode="lines",
-            line=dict(color=COLOR_MAJOR_EVENT, width=2.5),
-            yaxis="y2",
-            hovertemplate="%{y:,.0f} customer-min<extra>cumulative</extra>",
+            line=dict(color=COLOR_PRIMARY, width=2.5),
+            fill="tozeroy",
+            fillcolor=COLOR_PRIMARY_FILL,
+            hovertemplate=(
+                "%{y:,.1f} min/customer so far"
+                "<br>%{customdata[0]:,.2f} min/customer this day"
+                "<br>%{customdata[1]:,.0f} customer-minutes so far"
+                "<extra></extra>"
+            ),
         )
     )
     figure.update_layout(
-        title=f"Customer-minutes escalation (last {span_days} day(s))",
-        yaxis=dict(title="Per hour"),
-        yaxis2=dict(title="Cumulative", overlaying="y", side="right", showgrid=False),
-        legend=dict(orientation="h", y=1.12, x=0),
+        title="Cumulative SAIDI (running total)",
+        yaxis_title="Minutes per customer",
+        showlegend=False,
     )
-    return _figure_to_html(figure)
+    return _figure_to_html(figure) + _chart_key(["SAIDI"])
 
 
 def build_region_comparison_figure(region_daily_points: list[MetricPoint]) -> str:
@@ -780,7 +856,7 @@ def build_region_comparison_figure(region_daily_points: list[MetricPoint]) -> st
         showlegend=False,
         height=420,
     )
-    return _figure_to_html(figure)
+    return _figure_to_html(figure) + _chart_key(["SAIDI"])
 
 
 def _most_recent_consecutive_days(daily_points: list[MetricPoint]) -> list[datetime]:
@@ -1033,6 +1109,12 @@ PAGE_STYLESHEET = """
     box-shadow: var(--shadow); padding: 1.25rem; margin-top: 2rem;
   }
   .panel:first-child { margin-top: 0; }
+  .chart-key {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 0.35rem 1.25rem;
+    margin-top: 0.5rem; padding-top: 0.75rem; border-top: 1px solid var(--border);
+    font-size: 0.8rem; color: var(--muted);
+  }
+  .chart-key-item strong { color: var(--text); font-weight: 600; margin-right: 0.3rem; }
   .empty-state { padding: 48px 16px; text-align: center; color: var(--muted); font-size: 0.9rem; }
 
   /* Main chart controls */
@@ -1134,6 +1216,21 @@ PAGE_STYLESHEET = """
     border: 1px solid rgba(245, 158, 11, 0.2);
   }
   .status-estimated .status-dot { background: var(--coming-soon); }
+
+  /* Draft notice */
+  .draft-banner {
+    display: flex; align-items: flex-start; gap: 0.75rem;
+    background: rgba(245, 158, 11, 0.1); color: #92400e;
+    border: 1px solid rgba(245, 158, 11, 0.35); border-left: 4px solid var(--coming-soon);
+    border-radius: 15px; padding: 1rem 1.25rem; margin-bottom: 2rem;
+    font-size: 0.95rem; line-height: 1.6;
+  }
+  .draft-banner-label {
+    flex-shrink: 0; background: var(--coming-soon); color: #fff;
+    font-size: 0.75rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+    border-radius: 999px; padding: 0.15rem 0.6rem; margin-top: 0.15rem;
+  }
+  .draft-banner strong { color: #78350f; }
 
   /* Helper panel */
   .callout {
@@ -1349,11 +1446,20 @@ def build_indices_page_html(
         coverage_sentence = "Awaiting the first full day of data."
 
     body_html = f"""
+    <div class="draft-banner" role="note">
+      <span class="draft-banner-label">Draft</span>
+      <span>
+        <strong>Everything on this page is draft work still in development.</strong>
+        The indices, charts and explanations may change as the methods are
+        reviewed and more data is collected, so please don't rely on these
+        figures yet.
+      </span>
+    </div>
     <p class="data-range-note">{html.escape(coverage_sentence)}</p>
     {build_kpi_cards(summary)}
     <div class="panel">{build_outage_level_figure(hourly_points)}</div>
-    <div class="panel">{build_customer_minutes_escalation_figure(hourly_points)}</div>
     <div class="panel">{build_daily_saidi_figure(daily_points, major_event_days)}</div>
+    <div class="panel">{build_cumulative_saidi_figure(daily_points)}</div>
     <div class="panel">{build_index_trend_figure(daily_points)}</div>
     <div class="panel">{build_region_comparison_figure(region_daily_points)}</div>
 
