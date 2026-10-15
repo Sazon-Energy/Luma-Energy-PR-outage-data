@@ -155,14 +155,30 @@ trapezoidal-integration / rising-edge methodology.
 
 GitHub Pages has no page-view statistics of its own (the repo's Insights ->
 Traffic tab counts visits to the repository, not to the published site), so
-the dashboard carries a [Cloudflare Web Analytics](https://www.cloudflare.com/web-analytics/)
-beacon: free, cookie-free, and no consent banner needed.
+the dashboard carries two optional tags, each added only when its repository
+variable is set:
+
+- [Cloudflare Web Analytics](https://www.cloudflare.com/web-analytics/)
+  (`CLOUDFLARE_ANALYTICS_TOKEN`): free, cookie-free page views, referrers,
+  countries and devices.
+- [LinkedIn Insight Tag](https://www.linkedin.com/help/lms/answer/a418880)
+  (`LINKEDIN_PARTNER_ID`): aggregate company, industry, job function and
+  seniority of LinkedIn-member visitors, in Campaign Manager -> Analyze ->
+  Website demographics. LinkedIn never identifies individuals, and a breakdown
+  only appears once a segment passes roughly 300 members. This tag sets
+  cookies.
 
 - **Setup:** Cloudflare dashboard -> Analytics & Logs -> Web Analytics -> Add a
   site (the Pages hostname) -> copy the token from the JS snippet. Then in this
   repo, Settings -> Secrets and variables -> Actions -> **Variables** -> New
   repository variable `CLOUDFLARE_ANALYTICS_TOKEN`. The next publish run adds
   the beacon to every page; without the variable the pages build without it.
+- **LinkedIn setup:** create a free ad account in Campaign Manager (no
+  campaign or payment method needed), then Measure -> Signals manager ->
+  Insight Tag -> install it yourself, and copy the number from
+  `_linkedin_partner_id = "...";`. Add it as repository variable
+  `LINKEDIN_PARTNER_ID`. The tag shows as "Unverified" until LinkedIn receives
+  its first visit from the published page, usually within a day.
 - **Viewing:** visits, referrers (LinkedIn shows as `linkedin.com` / `lnkd.in`),
   countries, devices and pages appear in that Cloudflare Web Analytics site.
 - **Tracking shared links:** add UTM parameters to links you post, so each

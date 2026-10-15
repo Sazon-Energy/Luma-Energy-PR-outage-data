@@ -36,6 +36,7 @@ jobs:
       # Public site token (Settings -> Secrets and variables -> Actions ->
       # Variables); when unset the pages are built without analytics.
       CLOUDFLARE_ANALYTICS_TOKEN: ${{ vars.CLOUDFLARE_ANALYTICS_TOKEN }}
+      LINKEDIN_PARTNER_ID: ${{ vars.LINKEDIN_PARTNER_ID }}
     steps:
       - uses: actions/checkout@v7
 

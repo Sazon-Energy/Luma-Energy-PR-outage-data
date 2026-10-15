@@ -1384,6 +1384,7 @@ def _render_page(
     <span class="hover-tooltip tooltip-above tooltip-light" id="source-notes" role="tooltip">{source_lines}</span>
   </span>
 </footer>
+{_render_linkedin_insight_tag()}
 </body>
 </html>"""
 
@@ -1401,9 +1402,42 @@ def _render_analytics_snippets() -> str:
     return "\n".join(snippets)
 
 
+
+def _render_linkedin_insight_tag() -> str:
+    """LinkedIn's standard Insight Tag, placed just before </body> as LinkedIn
+    recommends (its <noscript> image is not valid inside <head>). Emitted only
+    when a numeric partner ID is configured."""
+    if not LINKEDIN_PARTNER_ID.isdigit():
+        return ""
+    return (
+        "<script>\n"
+        f'_linkedin_partner_id = "{LINKEDIN_PARTNER_ID}";\n'
+        "window._linkedin_data_partner_ids = window._linkedin_data_partner_ids || [];\n"
+        "window._linkedin_data_partner_ids.push(_linkedin_partner_id);\n"
+        "</script>\n"
+        "<script>\n"
+        "(function(lintrk) {\n"
+        "  if (!lintrk) { window.lintrk = function(action, data) { window.lintrk.q.push([action, data]); };\n"
+        "    window.lintrk.q = []; }\n"
+        '  var firstScript = document.getElementsByTagName("script")[0];\n'
+        '  var insightScript = document.createElement("script");\n'
+        "  insightScript.async = true;\n"
+        '  insightScript.src = "https://snap.licdn.com/li.lms-analytics/insight.min.js";\n'
+        "  firstScript.parentNode.insertBefore(insightScript, firstScript);\n"
+        "})(window.lintrk);\n"
+        "</script>\n"
+        "<noscript><img height=\"1\" width=\"1\" style=\"display:none;\" alt=\"\" "
+        f'src="https://px.ads.linkedin.com/collect/?pid={LINKEDIN_PARTNER_ID}&amp;fmt=gif"></noscript>'
+    )
+
 # Cloudflare Web Analytics site token (cookie-free page-view counts). Public
 # once rendered into the page, so it is a repository variable, not a secret.
 CLOUDFLARE_ANALYTICS_TOKEN = os.environ.get("CLOUDFLARE_ANALYTICS_TOKEN", "").strip()
+
+# LinkedIn Insight Tag partner ID (aggregate company / job-title demographics of
+# LinkedIn-member visitors, shown in Campaign Manager). Public once rendered, so
+# it is a repository variable, not a secret.
+LINKEDIN_PARTNER_ID = os.environ.get("LINKEDIN_PARTNER_ID", "").strip()
 
 MAIN_PAGE_FILE_NAME = "index.html"
 INDICES_PAGE_FILE_NAME = "indices.html"
