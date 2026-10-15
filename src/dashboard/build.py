@@ -13,6 +13,7 @@ from __future__ import annotations
 import html
 import json
 import math
+import os
 from datetime import date, datetime, timedelta, timezone
 
 import plotly.graph_objects as graph_objects
@@ -1360,6 +1361,7 @@ def _render_page(
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js" charset="utf-8"></script>
 <style>{PAGE_STYLESHEET}</style>
+{_render_analytics_snippets()}
 </head>
 <body>
 <header class="site-header">
@@ -1385,6 +1387,23 @@ def _render_page(
 </body>
 </html>"""
 
+
+def _render_analytics_snippets() -> str:
+    """Visitor-analytics tags for the shared <head>. Each tag is emitted only
+    when its ID is configured, so local builds stay free of tracking."""
+    snippets = []
+    if CLOUDFLARE_ANALYTICS_TOKEN:
+        beacon_settings = html.escape(json.dumps({"token": CLOUDFLARE_ANALYTICS_TOKEN}))
+        snippets.append(
+            '<script defer src="https://static.cloudflareinsights.com/beacon.min.js" '
+            f'data-cf-beacon="{beacon_settings}"></script>'
+        )
+    return "\n".join(snippets)
+
+
+# Cloudflare Web Analytics site token (cookie-free page-view counts). Public
+# once rendered into the page, so it is a repository variable, not a secret.
+CLOUDFLARE_ANALYTICS_TOKEN = os.environ.get("CLOUDFLARE_ANALYTICS_TOKEN", "").strip()
 
 MAIN_PAGE_FILE_NAME = "index.html"
 INDICES_PAGE_FILE_NAME = "indices.html"

@@ -151,6 +151,25 @@ trapezoidal-integration / rising-edge methodology.
    redundant fallback, and the workflow can also be run on demand from the
    Actions tab ("Run workflow").
 
+## Visitor analytics
+
+GitHub Pages has no page-view statistics of its own (the repo's Insights ->
+Traffic tab counts visits to the repository, not to the published site), so
+the dashboard carries a [Cloudflare Web Analytics](https://www.cloudflare.com/web-analytics/)
+beacon: free, cookie-free, and no consent banner needed.
+
+- **Setup:** Cloudflare dashboard -> Analytics & Logs -> Web Analytics -> Add a
+  site (the Pages hostname) -> copy the token from the JS snippet. Then in this
+  repo, Settings -> Secrets and variables -> Actions -> **Variables** -> New
+  repository variable `CLOUDFLARE_ANALYTICS_TOKEN`. The next publish run adds
+  the beacon to every page; without the variable the pages build without it.
+- **Viewing:** visits, referrers (LinkedIn shows as `linkedin.com` / `lnkd.in`),
+  countries, devices and pages appear in that Cloudflare Web Analytics site.
+- **Tracking shared links:** add UTM parameters to links you post, so each
+  post's traffic is distinguishable even when the LinkedIn app strips the
+  referrer, e.g.
+  `index.html?utm_source=linkedin&utm_medium=social&utm_campaign=<post-name>`.
+
 ## Running locally
 
 ```bash
