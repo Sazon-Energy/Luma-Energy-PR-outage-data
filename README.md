@@ -234,6 +234,12 @@ order by event_date desc;
 
 ## Roadmap
 
+- **Review HTTPS enforcement (open).** The dashboard is also served over plain
+  `http://sazonenergy.com/Luma-Energy-PR-outage-data/` with no redirect to
+  HTTPS. The fix is the **Enforce HTTPS** checkbox under Settings -> Pages in
+  the *website* repository (it owns the `sazonenergy.com` custom domain);
+  check that the certificate is issued and nothing on the main site breaks
+  before enabling it.
 - **Municipality/town-level detail.** The LUMA API also exposes a
   `POST /outage/municipality/towns` endpoint with per-town outage areas and
   zones (no customer counts, no timestamp of its own). Adding it unlocks
