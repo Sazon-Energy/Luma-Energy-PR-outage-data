@@ -33,6 +33,9 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      # Public site token (Settings -> Secrets and variables -> Actions ->
+      # Variables); when unset the pages are built without analytics.
+      CLOUDFLARE_ANALYTICS_TOKEN: ${{ vars.CLOUDFLARE_ANALYTICS_TOKEN }}
     steps:
       - uses: actions/checkout@v7
 
