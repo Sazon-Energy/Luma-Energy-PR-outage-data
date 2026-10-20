@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from supabase import Client
 
@@ -251,7 +251,3 @@ def earliest_timestamp_for_lookback(lookback_days: int) -> datetime:
     against a late-arriving or backfilled sample.
     """
     return datetime.now(timezone.utc) - timedelta(days=lookback_days)
-
-
-def local_date_of(moment: datetime) -> date:
-    return moment.date()

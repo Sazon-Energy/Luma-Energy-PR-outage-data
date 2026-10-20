@@ -76,6 +76,13 @@ DEFAULT_GRANULARITY = VIEW_OPTIONS[DEFAULT_VIEW_INDEX]["granularity"]
 
 CUSTOMERS_OUT_FIGURE_DIV_ID = "customers-out-figure"
 
+# Hover read-out headers. Times are Puerto Rico local wall-clock (see
+# `_to_puerto_rico_wall_clock`), so the zone code is a fixed label; Puerto
+# Rico stays on AST all year. Day-level views show a date only.
+PUERTO_RICO_TIMEZONE_CODE = "AST"
+HOURLY_HOVER_FORMAT = f"%b %-d, %Y, %H:%M {PUERTO_RICO_TIMEZONE_CODE}"
+DAILY_HOVER_FORMAT = "%b %-d, %Y"
+
 
 # One-to-three-word meanings shown in the key under each chart, so readers new
 # to reliability indices can tell what each term measures. Charts pick the
@@ -141,6 +148,17 @@ def _figure_to_html(
 
 def _empty_state(message: str) -> str:
     return f'<div class="empty-state">{html.escape(message)}</div>'
+
+
+def _to_puerto_rico_wall_clock(moment: datetime) -> datetime:
+    """Puerto Rico local time with the time zone removed (a "naive"
+    datetime, in Python's terms). plotly.js ignores UTC offsets and draws
+    whatever clock time it is given, so it must be given local time."""
+    return moment.astimezone(PUERTO_RICO_TIMEZONE).replace(tzinfo=None)
+
+
+def _to_puerto_rico_wall_clocks(moments: list[datetime]) -> list[datetime]:
+    return [_to_puerto_rico_wall_clock(moment) for moment in moments]
 
 
 def _customers_out_axis(
@@ -220,7 +238,7 @@ def _build_customers_out_figure(
     for cause_basis, label, color in shown_segments:
         figure.add_trace(
             graph_objects.Bar(
-                x=hourly_axis,
+                x=_to_puerto_rico_wall_clocks(hourly_axis),
                 y=_customers_out_series(hourly_points_by_cause[cause_basis], hourly_axis),
                 name=label,
                 marker_color=color,
@@ -231,7 +249,7 @@ def _build_customers_out_figure(
     for cause_basis, label, color in shown_segments:
         figure.add_trace(
             graph_objects.Bar(
-                x=daily_axis,
+                x=_to_puerto_rico_wall_clocks(daily_axis),
                 y=_customers_out_series(daily_points_by_cause[cause_basis], daily_axis),
                 name=label,
                 marker_color=color,
@@ -253,7 +271,12 @@ def _build_customers_out_figure(
                 "Hour (Puerto Rico local time)"
                 if DEFAULT_GRANULARITY == "hour"
                 else "Day (Puerto Rico local time)"
-            )
+            ),
+            hoverformat=(
+                HOURLY_HOVER_FORMAT
+                if DEFAULT_GRANULARITY == "hour"
+                else DAILY_HOVER_FORMAT
+            ),
         ),
         barmode="stack",
         legend=dict(orientation="h", y=1.1, x=0),
@@ -345,6 +368,23 @@ def build_window_controls_markup(available_days: int) -> str:
     </div>"""
 
 
+def build_puerto_rico_clock_markup() -> str:
+    """Today's Puerto Rico date over the current time and the newest
+    snapshot's time, shown under the main chart in the 48 h view only. Both
+    times share the one date, so they line up in a column beneath it. The
+    inline script fills in the values and keeps the clock ticking."""
+    return f"""
+    <div class="chart-clock" id="puerto-rico-clock" hidden>
+      <dl class="chart-clock-grid">
+        <dt class="chart-clock-date" id="puerto-rico-current-date">—</dt>
+        <dt>Current time in Puerto Rico</dt>
+        <dd><span id="puerto-rico-current-time">—</span> {PUERTO_RICO_TIMEZONE_CODE}</dd>
+        <dt>Most recent data</dt>
+        <dd><span id="most-recent-data-time">—</span> {PUERTO_RICO_TIMEZONE_CODE}</dd>
+      </dl>
+    </div>"""
+
+
 def build_window_controls_script(
     daily_axis: list[datetime],
     snapshot_timestamps: list[datetime],
@@ -360,7 +400,7 @@ def build_window_controls_script(
     ]
 
     daily_data = {
-        "dates": [period_start.strftime("%Y-%m-%d") for period_start in daily_axis],
+        "dates": [local_date.isoformat() for local_date in local_dates],
         "capturedSamples": [
             captured_samples_by_day.get(local_date, 0) for local_date in local_dates
         ],
@@ -368,6 +408,11 @@ def build_window_controls_script(
             expected_samples_for_day(local_date, generated_at) for local_date in local_dates
         ],
     }
+    # The newest successful scrape, as an ISO instant; the script renders it
+    # in Puerto Rico time.
+    daily_data["mostRecentSnapshot"] = (
+        max(snapshot_timestamps).isoformat() if snapshot_timestamps else None
+    )
     payload = json.dumps(daily_data)
     view_options_payload = json.dumps(VIEW_OPTIONS)
 
@@ -386,6 +431,10 @@ def build_window_controls_script(
       var coverageValue = document.getElementById('window-coverage-value');
       var coverageTooltip = document.getElementById('window-coverage-tooltip');
       var buttons = document.querySelectorAll('.window-btn');
+      var clockPanel = document.getElementById('puerto-rico-clock');
+      var currentDateValue = document.getElementById('puerto-rico-current-date');
+      var currentTimeValue = document.getElementById('puerto-rico-current-time');
+      var mostRecentDataValue = document.getElementById('most-recent-data-time');
       var availableDays = dailyData.dates.length;
       var activeView = viewOptions[{DEFAULT_VIEW_INDEX}];
       var sampleIntervalMinutes = {SAMPLE_INTERVAL_MINUTES};
@@ -415,6 +464,28 @@ def build_window_controls_script(
         return value.toLocaleString(undefined, {{
           minimumFractionDigits: decimals, maximumFractionDigits: decimals
         }}) + suffix;
+      }}
+
+      // Always Puerto Rico time, whatever the viewer's own time zone is.
+      var puertoRicoTimeFormat = new Intl.DateTimeFormat('en-US', {{
+        timeZone: 'America/Puerto_Rico', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+      }});
+      var puertoRicoDateFormat = new Intl.DateTimeFormat('en-US', {{
+        timeZone: 'America/Puerto_Rico', weekday: 'short', month: 'short', day: 'numeric', year: 'numeric'
+      }});
+
+      // One shared date heads both times. Only when the newest data is from
+      // an earlier Puerto Rico day does it carry its own date, so stale data
+      // can't pass for today's.
+      function updatePuertoRicoClock() {{
+        var now = new Date();
+        currentDateValue.textContent = puertoRicoDateFormat.format(now);
+        currentTimeValue.textContent = puertoRicoTimeFormat.format(now);
+        if (!dailyData.mostRecentSnapshot) return;
+        var mostRecentSnapshot = new Date(dailyData.mostRecentSnapshot);
+        var snapshotDate = puertoRicoDateFormat.format(mostRecentSnapshot);
+        var datePrefix = snapshotDate === puertoRicoDateFormat.format(now) ? '' : snapshotDate + ', ';
+        mostRecentDataValue.textContent = datePrefix + puertoRicoTimeFormat.format(mostRecentSnapshot);
       }}
 
       function setActiveButton(target) {{
@@ -500,6 +571,7 @@ def build_window_controls_script(
         var dayCountSuffix = ' (' + actualDays + (actualDays === 1 ? ' day)' : ' days)');
 
         showTraceGroup(activeView.granularity, readOutageTypeVisibility());
+        clockPanel.hidden = activeView.granularity !== 'hour';
         if (activeView.granularity === 'hour') {{
           Plotly.relayout(figureDiv, {{
             'xaxis.autorange': false,
@@ -507,6 +579,7 @@ def build_window_controls_script(
             // are fully included.
             'xaxis.range': [startDate, addDays(endDate, 1)],
             'xaxis.title.text': 'Hour (Puerto Rico local time)',
+            'xaxis.hoverformat': {json.dumps(HOURLY_HOVER_FORMAT)},
             'yaxis.title.text': 'Customers out (hourly peak)',
             'yaxis.autorange': true
           }});
@@ -515,6 +588,7 @@ def build_window_controls_script(
             'xaxis.autorange': false,
             'xaxis.range': [startDate, endDate],
             'xaxis.title.text': 'Day (Puerto Rico local time)',
+            'xaxis.hoverformat': {json.dumps(DAILY_HOVER_FORMAT)},
             'yaxis.title.text': 'Customers out (daily peak)',
             'yaxis.autorange': true
           }});
@@ -585,6 +659,8 @@ def build_window_controls_script(
         if (event.persisted) resetToDefaultView();
       }});
 
+      updatePuertoRicoClock();
+      setInterval(updatePuertoRicoClock, 15000);
       resetToDefaultView();
     }})();
     </script>"""
@@ -629,7 +705,9 @@ def build_customers_out_section(
 
     key_html = _chart_key([label for _, label, _ in shown_segments])
 
-    return f"{controls_html}{figure_html}{key_html}{script_html}"
+    clock_html = build_puerto_rico_clock_markup()
+
+    return f"{controls_html}{figure_html}{key_html}{clock_html}{script_html}"
 
 
 def build_outage_level_figure(hourly_points: list[MetricPoint]) -> str:
@@ -641,7 +719,7 @@ def build_outage_level_figure(hourly_points: list[MetricPoint]) -> str:
     figure = graph_objects.Figure()
     figure.add_trace(
         graph_objects.Scatter(
-            x=[point.period_start for point in recent_points],
+            x=[_to_puerto_rico_wall_clock(point.period_start) for point in recent_points],
             y=[point.mean_customers_without_service for point in recent_points],
             name="Mean customers out",
             mode="lines",
@@ -653,7 +731,7 @@ def build_outage_level_figure(hourly_points: list[MetricPoint]) -> str:
     )
     figure.add_trace(
         graph_objects.Scatter(
-            x=[point.period_start for point in recent_points],
+            x=[_to_puerto_rico_wall_clock(point.period_start) for point in recent_points],
             y=[point.peak_customers_without_service for point in recent_points],
             name="Peak customers out",
             mode="lines",
@@ -665,6 +743,7 @@ def build_outage_level_figure(hourly_points: list[MetricPoint]) -> str:
         title="Customers without service (hourly)",
         yaxis_title="Customers",
         xaxis_title=None,
+        xaxis_hoverformat=HOURLY_HOVER_FORMAT,
         legend=dict(orientation="h", y=1.12, x=0),
     )
     return _figure_to_html(figure) + _chart_key(["Mean", "Peak"])
@@ -685,7 +764,7 @@ def build_daily_saidi_figure(
     }
     bar_colors = [
         COLOR_MAJOR_EVENT
-        if point.period_start.date() in major_event_dates
+        if point.period_start.astimezone(PUERTO_RICO_TIMEZONE).date() in major_event_dates
         else COLOR_PRIMARY
         for point in daily_points
     ]
@@ -693,7 +772,7 @@ def build_daily_saidi_figure(
     figure = graph_objects.Figure()
     figure.add_trace(
         graph_objects.Bar(
-            x=[point.period_start for point in daily_points],
+            x=[_to_puerto_rico_wall_clock(point.period_start) for point in daily_points],
             y=[point.saidi_minutes for point in daily_points],
             marker_color=bar_colors,
             name="Daily SAIDI",
@@ -737,7 +816,9 @@ def build_index_trend_figure(daily_points: list[MetricPoint]) -> str:
         return _empty_state("No daily data yet.")
 
     daily_points = _limit_to_recent_days(daily_points, MAXIMUM_HISTORY_DAYS)
-    period_starts = [point.period_start for point in daily_points]
+    period_starts = [
+        _to_puerto_rico_wall_clock(point.period_start) for point in daily_points
+    ]
     figure = make_subplots(
         rows=2,
         cols=1,
@@ -803,7 +884,7 @@ def build_cumulative_saidi_figure(daily_points: list[MetricPoint]) -> str:
     figure = graph_objects.Figure()
     figure.add_trace(
         graph_objects.Scatter(
-            x=[point.period_start for point in counted_points],
+            x=[_to_puerto_rico_wall_clock(point.period_start) for point in counted_points],
             y=cumulative_saidi_values,
             customdata=hover_details,
             name="Cumulative SAIDI",
@@ -1116,6 +1197,21 @@ PAGE_STYLESHEET = """
     font-size: 0.8rem; color: var(--muted);
   }
   .chart-key-item strong { color: var(--text); font-weight: 600; margin-right: 0.3rem; }
+  .chart-clock {
+    margin-top: 0.5rem; text-align: right; font-size: 0.8rem; color: var(--muted);
+    font-variant-numeric: tabular-nums; line-height: 1.5;
+  }
+  .chart-clock[hidden] { display: none; }
+  .chart-clock-grid {
+    display: inline-grid; grid-template-columns: auto auto; column-gap: 0.75rem;
+    margin: 0; text-align: left;
+  }
+  .chart-clock-grid dt, .chart-clock-grid dd { margin: 0; }
+  .chart-clock-grid dd { text-align: right; color: var(--text); }
+  .chart-clock-date {
+    grid-column: 1 / -1; text-align: right; font-weight: 600; color: var(--text);
+    padding-bottom: 0.15rem; margin-bottom: 0.15rem; border-bottom: 1px solid var(--border);
+  }
   .empty-state { padding: 48px 16px; text-align: center; color: var(--muted); font-size: 0.9rem; }
 
   /* Main chart controls */
@@ -1379,7 +1475,7 @@ def _render_page(
 </main>
 <footer class="site-footer">
   <span class="footer-generated tooltip-anchor" tabindex="0" aria-describedby="source-notes">
-    Generated {generated_at:%Y-%m-%d %H:%M} UTC
+    Generated {generated_at.astimezone(PUERTO_RICO_TIMEZONE):%Y-%m-%d %H:%M} AST ({generated_at:%H:%M} UTC)
     <i class="info-icon" aria-hidden="true">i</i>
     <span class="hover-tooltip tooltip-above tooltip-light" id="source-notes" role="tooltip">{source_lines}</span>
   </span>
