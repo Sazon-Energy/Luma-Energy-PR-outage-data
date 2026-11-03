@@ -20,11 +20,14 @@ concurrency:
 
 jobs:
   build-and-deploy:
-    # Skip when triggered by a failed collection run (nothing new to show);
-    # manual dispatch always proceeds.
+    # Also rebuilds after a failed collection run, so the unlinked
+    # status.html page shows the failure (the public pages simply come out
+    # unchanged). Cancelled backlog runs are skipped; manual dispatch always
+    # proceeds.
     if: >
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      github.event.workflow_run.conclusion == 'success' ||
+      github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment:

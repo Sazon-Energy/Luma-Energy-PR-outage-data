@@ -1,8 +1,9 @@
 """Generate the static reliability dashboard.
 
 Run with `python -m src.dashboard`. Writes the site's self-contained HTML pages
-(the grid reliability page and the reliability indices page) into one
-directory, which the GitHub Actions workflow publishes to GitHub Pages.
+(the grid reliability page, the reliability indices page and the unlinked
+collection-health status page) into one directory, which the GitHub Actions
+workflow publishes to GitHub Pages.
 """
 
 from __future__ import annotations
@@ -14,9 +15,15 @@ from pathlib import Path
 
 from src.dashboard.build import MAXIMUM_HISTORY_DAYS, build_site_pages
 from src.dashboard.data import (
+    load_collection_attempts,
     load_major_event_days,
     load_metric_series,
     load_snapshot_timestamps,
+)
+from src.dashboard.status import (
+    STATUS_HISTORY_DAYS,
+    STATUS_PAGE_FILE_NAME,
+    build_status_page_html,
 )
 from src.supabase_writer import build_supabase_client
 
@@ -78,6 +85,27 @@ def main() -> int:
         hourly_points_by_cause=hourly_points_by_cause,
         daily_points_by_cause=daily_points_by_cause,
         snapshot_timestamps=snapshot_timestamps,
+    )
+
+    generated_at = datetime.now(timezone.utc)
+    status_window_start = generated_at - timedelta(days=STATUS_HISTORY_DAYS)
+    try:
+        collection_attempts = load_collection_attempts(
+            supabase_client, since=status_window_start
+        )
+    except Exception as load_error:
+        # e.g. db/schema.sql not re-run yet, so the table doesn't exist. The
+        # public pages must still publish; the status page shows coverage only.
+        print(f"warning: could not load collection_attempts ({load_error})")
+        collection_attempts = []
+    pages_by_file_name[STATUS_PAGE_FILE_NAME] = build_status_page_html(
+        snapshot_timestamps=[
+            timestamp
+            for timestamp in snapshot_timestamps
+            if timestamp >= status_window_start
+        ],
+        attempts=collection_attempts,
+        generated_at=generated_at,
     )
 
     arguments.output_directory.mkdir(parents=True, exist_ok=True)

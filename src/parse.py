@@ -33,17 +33,36 @@ class RegionRecord:
     percentage_clients_without_service: float | None
 
 
+class InvalidPayloadError(ValueError):
+    """Raised when a JSON reply lacks a readable `timestamp`.
+
+    LUMA's API occasionally answers with JSON that has no timestamp at all
+    (seen alongside its read timeouts), which is worth retrying rather than
+    crashing on.
+    """
+
+
 def parse_source_timestamp(raw_timestamp_text: str) -> datetime:
     naive_timestamp = datetime.strptime(raw_timestamp_text, SOURCE_TIMESTAMP_FORMAT)
     return naive_timestamp.replace(tzinfo=PUERTO_RICO_TIMEZONE)
 
 
 def parse_snapshot(response_body: dict) -> tuple[SnapshotRecord, list[RegionRecord]]:
+    if not isinstance(response_body, dict) or not response_body.get("timestamp"):
+        raise InvalidPayloadError(
+            f"LUMA reply has no timestamp; reply starts: {str(response_body)[:200]}"
+        )
     raw_timestamp_text = response_body["timestamp"]
+    try:
+        source_timestamp = parse_source_timestamp(raw_timestamp_text)
+    except ValueError as format_error:
+        raise InvalidPayloadError(
+            f"LUMA timestamp {raw_timestamp_text!r} is unreadable ({format_error})"
+        ) from format_error
     totals = response_body.get("totals") or {}
 
     snapshot_record = SnapshotRecord(
-        source_timestamp=parse_source_timestamp(raw_timestamp_text),
+        source_timestamp=source_timestamp,
         source_timestamp_text=raw_timestamp_text,
         total_clients=totals.get("totalClients"),
         total_clients_with_service=totals.get("totalClientsWithService"),

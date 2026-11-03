@@ -22,16 +22,20 @@ Supabase pg_cron (every 10 minutes)
   -> calls GitHub's workflow_dispatch API for collect.yml
 GitHub Actions "Collect LUMA outage snapshot" (workflow_dispatch, plus a
 best-effort schedule: every 30 min as a fallback)
-  -> python -m src              fetch + parse + write one snapshot
-       (falls back to a headless browser if the WAF blocks the request)
+  -> python -m src              fetch + parse + write one snapshot, retrying
+       until ~4 min into the run; if every direct request failed,
+       python -m src --method browserless retries via a headless browser
+       until ~7 min in. Every attempt is logged to collection_attempts.
   -> python -m src.metrics      recompute reliability indices from history
 Supabase (Postgres)
   outage_snapshots (1) --- (many) region_readings
   reliability_metrics            hourly/daily/monthly SAIDI/SAIFI/CAIDI/ASAI
   major_event_days               IEEE 1366 Major Event Day classification
+  collection_attempts            one row per fetch attempt (collection health)
 
-GitHub Actions "Publish reliability dashboard" (on every successful collection)
-  -> python -m src.dashboard    render a static HTML page from the metric tables
+GitHub Actions "Publish reliability dashboard" (after every collection run
+that succeeded or failed)
+  -> python -m src.dashboard    render static HTML pages from those tables
   -> deploy to GitHub Pages
 ```
 
@@ -51,9 +55,79 @@ running (and failing) at once when it recovers. Cancelled runs don't send
 failure emails.
 
 The LUMA API sits behind an Incapsula WAF. A request with realistic browser
-headers usually passes; on the rare occasion it doesn't, the collection
-workflow falls back to loading the real status page in `browserless/chrome`
-and reading the same network response the page itself receives.
+headers usually passes. LUMA only ever shows its current figure, so one not
+captured within its 10-minute slot is lost for good; each run therefore keeps
+retrying direct requests (WAF blocks, timeouts, connection errors and replies
+with no timestamp alike) until about 4 minutes in, then falls back to loading
+the real status page in `browserless/chrome` and reading the same network
+response the page itself receives, until about 7 minutes in.
+
+## Collection health
+
+Every fetch attempt - direct or browserless, successful or not - is recorded
+in `collection_attempts` with its method, attempt number, start time,
+duration, outcome (`captured`, `already_recorded`, `waf_blocked`, `timeout`,
+`connection_error`, `invalid_payload`, `capture_error`, `write_error`), HTTP
+status and error message. It's rendered on an unlinked page,
+`https://sazonenergy.com/Luma-Energy-PR-outage-data/status.html`: coverage
+over 24 hours, 7 days and 30 days, first-try success and fallback rates,
+attempts per day by outcome, attempt durations, and a table of every missed
+slot with what each attempt in it returned.
+
+Coverage is read from `outage_snapshots` itself (a 10-minute slot with no
+snapshot is a miss), so it's correct even for runs that never got far enough
+to log anything. A missed slot with no attempts at all points at the trigger
+(pg_cron, GitHub Actions) rather than LUMA.
+
+```sql
+-- Failed attempts, newest first
+select started_at, method, attempt_number, outcome, http_status,
+       duration_milliseconds, error_message
+from collection_attempts
+where outcome not in ('captured', 'already_recorded')
+order by started_at desc
+limit 50;
+
+-- Outcome mix per method, last 7 days
+select method, outcome, count(*)
+from collection_attempts
+where started_at > now() - interval '7 days'
+group by method, outcome
+order by method, count(*) desc;
+```
+
+## Search engines and AI crawlers
+
+Every page carries
+`<meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex, noai, noimageai">`,
+which Google and Bing honor. GitHub Pages can't send an `X-Robots-Tag`
+header, and most AI crawlers only read `robots.txt`, which has to live at the
+`sazonenergy.com` root - the **website** repository, not this one. Add this
+there:
+
+```
+User-agent: GPTBot
+User-agent: ChatGPT-User
+User-agent: OAI-SearchBot
+User-agent: ClaudeBot
+User-agent: Claude-User
+User-agent: Claude-SearchBot
+User-agent: anthropic-ai
+User-agent: CCBot
+User-agent: Google-Extended
+User-agent: Applebot-Extended
+User-agent: PerplexityBot
+User-agent: Perplexity-User
+User-agent: Bytespider
+User-agent: meta-externalagent
+User-agent: Amazonbot
+User-agent: cohere-ai
+Disallow: /Luma-Energy-PR-outage-data/
+```
+
+Googlebot and Bingbot are deliberately *not* disallowed: a crawler that's
+blocked from fetching a page never sees its `noindex` tag, and can still list
+the bare URL from links elsewhere.
 
 ## Reliability metrics
 
@@ -195,9 +269,9 @@ pip install -r requirements.txt
 cp .env.example .env   # fill in SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
 set -a && source .env && set +a
 
-python -m src              # collect one snapshot
+python -m src              # collect one snapshot (logs each attempt)
 python -m src.metrics      # recompute reliability metrics (add --full to rebuild all history)
-python -m src.dashboard    # render site/index.html and site/indices.html
+python -m src.dashboard    # render site/index.html, indices.html and status.html
 ```
 
 A successful collection run prints either a new snapshot id or a message that
@@ -225,6 +299,12 @@ from reliability_metrics
 where granularity = 'day' and scope_name = 'Island-wide' and cause_basis = 'all'
 order by period_start desc;
 
+-- Collection attempts that failed (see "Collection health")
+select started_at, method, outcome, error_message
+from collection_attempts
+where outcome not in ('captured', 'already_recorded')
+order by started_at desc limit 20;
+
 -- Confirmed Major Event Days
 select event_date, daily_saidi_minutes, threshold_t_med
 from major_event_days
@@ -248,5 +328,8 @@ order by event_date desc;
 - **Selectable cause basis in the dashboard.** `unplanned` / `planned` /
   `load_shed` splits are already computed and stored; only the `all` basis is
   currently rendered.
+- **Collection health follow-ups.** Add pg_cron trigger health
+  (`cron.job_run_details` / `net._http_response`) to the status page, and an
+  alert (e.g. a GitHub issue opened by the workflow) when coverage drops.
 - Feeder/circuit-level analysis is not possible with the public API - it has
   no circuit or feeder identifiers at any granularity.
