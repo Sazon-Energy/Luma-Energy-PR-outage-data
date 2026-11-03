@@ -174,3 +174,50 @@ select cron.schedule(
     );
     $$
 );
+
+
+-- ---------------------------------------------------------------------------
+-- Collection health: one row per attempt to fetch LUMA's outage figures
+-- ---------------------------------------------------------------------------
+-- Written by `python -m src` for every direct request and every headless-
+-- browser (browserless) capture, successful or not, so failures can be
+-- analyzed long after GitHub Actions' 90-day log retention. Rendered on the
+-- unlinked status.html page.
+--
+-- This table explains *why* a slot was missed; whether it was missed is read
+-- from outage_snapshots itself (a 10-minute slot with no snapshot), so
+-- coverage stays correct even for runs that never got far enough to log
+-- anything (a pg_cron trigger or GitHub Actions failure).
+--
+-- outcome:
+--   captured          snapshot fetched and newly written
+--   already_recorded  fetched fine, but that source_timestamp was already stored
+--   waf_blocked       non-JSON reply (Incapsula WAF challenge page)
+--   timeout           request timed out
+--   connection_error  connection refused/reset, DNS failure, etc.
+--   invalid_payload   JSON reply missing or with an unreadable `timestamp`
+--   capture_error     browserless loaded the page but never saw the API reply
+--   write_error       fetched fine, but writing to Supabase failed
+
+create table if not exists collection_attempts (
+    id                        bigint generated always as identity primary key,
+    github_run_id             bigint,      -- null for local runs
+    github_run_attempt        integer,
+    method                    text        not null check (method in ('direct', 'browserless')),
+    attempt_number            integer     not null,
+    started_at                timestamptz not null,
+    duration_milliseconds     integer     not null,
+    outcome                   text        not null check (outcome in (
+                                  'captured', 'already_recorded', 'waf_blocked', 'timeout',
+                                  'connection_error', 'invalid_payload', 'capture_error',
+                                  'write_error'
+                              )),
+    http_status               integer,
+    error_message             text,
+    source_timestamp          timestamptz
+);
+
+create index if not exists collection_attempts_started_at_idx
+    on collection_attempts (started_at desc);
+
+grant select, insert on collection_attempts to service_role;

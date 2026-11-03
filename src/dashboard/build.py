@@ -1431,9 +1431,11 @@ def _render_page(
     current_page: str,
     body_html: str,
     generated_at: datetime,
+    include_visitor_analytics: bool = True,
 ) -> str:
     """Wrap a page body in the shared Sazon-styled header, hero and footer.
-    The hero subtitle is omitted when `lead` is None."""
+    The hero subtitle is omitted when `lead` is None. Every page asks search
+    engines and AI crawlers not to index it (see ROBOTS_META_CONTENT)."""
     current_marker = ' aria-current="page"'
     navigation_links = "".join(
         f'<li><a href="{file_name}"{current_marker if file_name == current_page else ""}>'
@@ -1451,13 +1453,14 @@ def _render_page(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="{ROBOTS_META_CONTENT}">
 <title>{html.escape(page_title)} — Sazon Energy</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js" charset="utf-8"></script>
 <style>{PAGE_STYLESHEET}</style>
-{_render_analytics_snippets()}
+{_render_analytics_snippets() if include_visitor_analytics else ""}
 </head>
 <body>
 <header class="site-header">
@@ -1480,7 +1483,7 @@ def _render_page(
     <span class="hover-tooltip tooltip-above tooltip-light" id="source-notes" role="tooltip">{source_lines}</span>
   </span>
 </footer>
-{_render_linkedin_insight_tag()}
+{_render_linkedin_insight_tag() if include_visitor_analytics else ""}
 </body>
 </html>"""
 
@@ -1534,6 +1537,14 @@ CLOUDFLARE_ANALYTICS_TOKEN = os.environ.get("CLOUDFLARE_ANALYTICS_TOKEN", "").st
 # LinkedIn-member visitors, shown in Campaign Manager). Public once rendered, so
 # it is a repository variable, not a secret.
 LINKEDIN_PARTNER_ID = os.environ.get("LINKEDIN_PARTNER_ID", "").strip()
+
+# Keeps the site out of search results and AI training/answer sets. Google
+# and Bing honor noindex/nofollow/noarchive/nosnippet/noimageindex; noai and
+# noimageai are non-standard opt-outs some AI crawlers read. GitHub Pages
+# can't send an X-Robots-Tag header, and most AI crawlers only obey
+# robots.txt, which must live at the sazonenergy.com root (the website
+# repository) - see the README's "Search engines and AI crawlers" section.
+ROBOTS_META_CONTENT = "noindex, nofollow, noarchive, nosnippet, noimageindex, noai, noimageai"
 
 MAIN_PAGE_FILE_NAME = "index.html"
 INDICES_PAGE_FILE_NAME = "indices.html"

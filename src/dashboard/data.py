@@ -170,3 +170,54 @@ def load_major_event_days(
         )
         for row in (response.data or [])
     ]
+
+
+@dataclass
+class CollectionAttempt:
+    github_run_id: int | None
+    method: str
+    attempt_number: int
+    started_at: datetime
+    duration_milliseconds: int
+    outcome: str
+    http_status: int | None
+    error_message: str | None
+
+
+def load_collection_attempts(
+    supabase_client: Client, since: datetime
+) -> list[CollectionAttempt]:
+    """Every logged collection attempt since `since`, oldest first."""
+    attempts: list[CollectionAttempt] = []
+    offset = 0
+
+    while True:
+        query = (
+            supabase_client.table("collection_attempts")
+            .select("*")
+            .gte("started_at", since.isoformat())
+        )
+        response = with_retry(
+            lambda: query.order("started_at")
+            .range(offset, offset + READ_PAGE_SIZE - 1)
+            .execute(),
+            description="select collection_attempts",
+        )
+        rows = response.data or []
+        attempts.extend(
+            CollectionAttempt(
+                github_run_id=row.get("github_run_id"),
+                method=row["method"],
+                attempt_number=int(row["attempt_number"]),
+                started_at=_parse_timestamp(row["started_at"]),
+                duration_milliseconds=int(row["duration_milliseconds"]),
+                outcome=row["outcome"],
+                http_status=row.get("http_status"),
+                error_message=row.get("error_message"),
+            )
+            for row in rows
+        )
+
+        if len(rows) < READ_PAGE_SIZE:
+            return attempts
+        offset += READ_PAGE_SIZE

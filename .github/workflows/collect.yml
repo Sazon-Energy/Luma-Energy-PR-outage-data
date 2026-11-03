@@ -47,6 +47,19 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
     steps:
+      # Both collection methods retry until a deadline measured from this
+      # moment (see DIRECT_FETCH_DEADLINE_SECONDS in src/constants.py), so
+      # the whole run fits inside LUMA's 10-minute publishing slot.
+      - name: Record collection start time
+        run: echo "COLLECTION_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
+      # Downloading the browserless image took ~40s of every fallback run.
+      # Pulling it in the background now (it keeps running across steps)
+      # means it is usually ready by the time a fallback needs it, and costs
+      # nothing when the direct request succeeds.
+      - name: Pre-pull browserless image
+        run: nohup docker pull browserless/chrome > /tmp/browserless_pull.log 2>&1 &
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
@@ -57,21 +70,24 @@ jobs:
         run: pip install -r requirements.txt
 
       # Captures the real exit code as a step output (rather than just
-      # success/failure) so the steps below can tell a WAF block (exit code 2,
-      # worth retrying via the headless-browser fallback) apart from any other
-      # error, such as a Supabase permission or schema problem, which
-      # wouldn't be fixed by retrying and shouldn't trigger the fallback.
+      # success/failure) so the steps below can tell "could not get LUMA's
+      # figures" (exit code 2 - WAF block, timeout, connection error or a
+      # reply with no timestamp, worth retrying via the headless-browser
+      # fallback) apart from any other error, such as a Supabase permission
+      # or schema problem, which wouldn't be fixed by retrying and shouldn't
+      # trigger the fallback. Every attempt is logged to collection_attempts.
       - name: Scrape
         id: scrape
         continue-on-error: true
         run: |
-          python -m src && exit_code=0 || exit_code=$?
+          python -m src --method direct && exit_code=0 || exit_code=$?
           echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
           exit "$exit_code"
 
-      # The fallback runs on a WAF block (exit code 2), or when forced via the
-      # workflow_dispatch input - but only on top of a successful direct
-      # scrape, never a genuine (non-WAF) error, which it couldn't fix.
+      # The fallback runs when the direct requests failed (exit code 2), or
+      # when forced via the workflow_dispatch input - but only on top of a
+      # successful direct scrape, never a genuine (non-fetch) error, which it
+      # couldn't fix.
       - name: Decide whether to use the browserless fallback
         id: fallback
         run: |
@@ -100,7 +116,8 @@ jobs:
             browserless/chrome
           # Wait until browserless actually answers HTTP rather than sleeping
           # a fixed time, so the first capture isn't sent to a container
-          # that's still starting up.
+          # that's still starting up. The capture itself retries a
+          # connection error, so this is a courtesy, not a requirement.
           for readiness_check in $(seq 1 30); do
             if curl --silent --output /dev/null http://localhost:3000/; then
               echo "browserless ready after ${readiness_check}s"
@@ -110,63 +127,16 @@ jobs:
           done
           echo "::warning::browserless did not answer within 30s; trying the capture anyway."
 
-      # The page-side logic lives in scripts/capture_region_snapshot.js; jq
-      # wraps it as the {"code": ...} body browserless's /function endpoint
-      # expects. Each attempt is checked right away, and the step stops at the
-      # first one that yields real JSON without a captureError - so one slow
-      # or flaky page load doesn't fail the whole run. Whatever the last
-      # attempt produced is left for the Validate step below to judge.
-      - name: Capture region snapshot via browserless
+      # Posts scripts/capture_region_snapshot.js to browserless and retries
+      # until BROWSERLESS_CAPTURE_DEADLINE_SECONDS after the run started,
+      # logging each attempt (with the page title/URL on failure, which
+      # shows a WAF challenge page as an Incapsula title).
+      - name: Scrape via browserless
         if: steps.fallback.outputs.needed == 'true'
-        run: |
-          capture_max_attempts=3
-          capture_retry_delay_seconds=10
-          jq --raw-input --slurp '{code: .}' scripts/capture_region_snapshot.js > /tmp/browserless_request.json
-          for capture_attempt in $(seq 1 "$capture_max_attempts"); do
-            curl --silent --max-time 90 --request POST \
-              --url http://localhost:3000/function \
-              --header 'Content-Type: application/json' \
-              --data @/tmp/browserless_request.json \
-              --output /tmp/clients_without_service.json || true
-            if jq --exit-status 'type == "object" and (has("captureError") | not)' /tmp/clients_without_service.json > /dev/null 2>&1; then
-              echo "captured region snapshot on attempt $capture_attempt/$capture_max_attempts"
-              cat /tmp/clients_without_service.json
-              exit 0
-            fi
-            echo "::warning::browserless capture attempt $capture_attempt/$capture_max_attempts failed; response:"
-            cat /tmp/clients_without_service.json 2>/dev/null || echo "(no response body)"
-            echo
-            if [ "$capture_attempt" -lt "$capture_max_attempts" ]; then
-              sleep "$capture_retry_delay_seconds"
-            fi
-          done
-
-      # Fails fast with a clear cause if every capture attempt above failed,
-      # rather than letting it surface two steps later as a confusing Python
-      # JSONDecodeError or KeyError. A failed capture is either plain error
-      # text from browserless or the JSON diagnostics (captureError, pageUrl,
-      # pageTitle, pageContentStart) from scripts/capture_region_snapshot.js -
-      # a WAF challenge page shows up there as an Incapsula title/content.
-      - name: Validate browserless capture
-        if: steps.fallback.outputs.needed == 'true'
-        run: |
-          if ! jq empty /tmp/clients_without_service.json 2>/dev/null; then
-            echo "::error::browserless did not return valid JSON - see the 'Capture region snapshot via browserless' step's output above for the actual response."
-            exit 1
-          fi
-          if jq --exit-status 'has("captureError")' /tmp/clients_without_service.json > /dev/null 2>&1; then
-            echo "::error::browserless capture failed: $(jq --raw-output '.captureError' /tmp/clients_without_service.json) (page title: $(jq --raw-output '.pageTitle' /tmp/clients_without_service.json)) - see the 'Capture region snapshot via browserless' step's output above for the full diagnostics."
-            exit 1
-          fi
-
-      - name: Scrape using captured snapshot
-        if: steps.fallback.outputs.needed == 'true'
-        run: python -m src
-        env:
-          CLIENTS_WITHOUT_SERVICE_FILE: /tmp/clients_without_service.json
+        run: python -m src --method browserless
 
       # Only runs once a snapshot was actually written this run - i.e. the
-      # direct scrape succeeded (exit code 0), or the WAF-blocked path (exit
+      # direct scrape succeeded (exit code 0), or the failed-fetch path (exit
       # code 2) recovered via the browserless fallback above. If the
       # fallback itself failed, that step's own failure already means this
       # one is skipped (its implicit success() check catches that), so no
@@ -175,10 +145,10 @@ jobs:
         if: steps.scrape.outputs.exit_code == '0' || steps.scrape.outputs.exit_code == '2'
         run: python -m src.metrics
 
-      - name: Fail job on non-WAF scrape error
+      - name: Fail job on non-fetch scrape error
         if: steps.scrape.outputs.exit_code != '0' && steps.scrape.outputs.exit_code != '2'
         run: |
-          echo "::error::Scrape failed for a reason other than a WAF block (see the Scrape step log above) - not retrying via the browserless fallback."
+          echo "::error::Scrape failed for a reason other than fetching LUMA's figures (see the Scrape step log above) - not retrying via the browserless fallback."
           exit 1
 
       - name: Stop browserless

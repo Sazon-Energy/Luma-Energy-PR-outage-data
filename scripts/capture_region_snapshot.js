@@ -1,15 +1,16 @@
 // Runs inside browserless (POSTed to its /function endpoint by
-// .github/workflows/collect.yml) when a direct request to the LUMA outage
-// API is blocked by the Incapsula WAF. Loads the real status page in
-// headless Chrome and returns the regionsWithoutService XHR response the
-// page itself makes, which passes the WAF like any other browser visit.
+// capture_region_snapshot_via_browserless in src/fetch.py) when direct
+// requests to the LUMA outage API fail, e.g. blocked by the Incapsula WAF.
+// Loads the real status page in headless Chrome and returns the
+// regionsWithoutService XHR response the page itself makes, which passes the
+// WAF like any other browser visit.
 //
 // The response listener is registered *before* navigating: page.goto waits
 // for the page's load event, and the XHR can finish before that - a
 // listener added after goto would miss it and time out.
 //
 // On failure this still returns JSON, carrying a captureError plus what the
-// page showed, so the workflow log can tell a WAF challenge page apart from
+// page showed, so the attempt log can tell a WAF challenge page apart from
 // the XHR simply never arriving.
 
 const STATUS_PAGE_URL = "https://miluma.lumapr.com/outages/serviceStatus";
