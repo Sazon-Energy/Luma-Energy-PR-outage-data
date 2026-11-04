@@ -1,18 +1,24 @@
 """Recompute reliability metrics and Major Event Day classification.
 
-Run with `python -m src.metrics`. Recent periods are recomputed in place on
+Run with `python -m src.metrics`. Recent days are recomputed in place on
 every run; Major Event Days are re-derived from the full daily history, which
 stays small enough to process in one pass.
+
+Only daily rows are computed: IEEE 1366 Major Event Days are defined on daily
+SAIDI, and the dashboard's indices and charts are all built from day rows.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from datetime import timedelta
 
 from src.metrics.major_event_days import classify_major_event_days
 from src.metrics.reliability import (
+    GRANULARITY_DAY,
     ISLAND_SCOPE_NAME,
+    MAXIMUM_INTERVAL_MINUTES,
     compute_metrics_for_scope,
 )
 from src.metrics.store import (
@@ -26,6 +32,7 @@ from src.metrics.store import (
 from src.supabase_writer import build_supabase_client
 
 DEFAULT_LOOKBACK_DAYS = 3
+METRIC_GRANULARITIES = (GRANULARITY_DAY,)
 
 # Which series the Major Event Day threshold is built from. IEEE 1366 applies
 # MED classification at the system level, so the island-wide series is the
@@ -64,18 +71,35 @@ def main() -> int:
     window_description = "full history" if since is None else f"since {since:%Y-%m-%d}"
     print(f"recomputing reliability metrics ({window_description})")
 
-    island_samples = load_island_samples(supabase_client, since=since)
-    samples_by_region = load_region_samples(supabase_client, since=since)
+    # Load a little before `since` so the window's first interval still has
+    # its preceding sample, exactly as a full rebuild would see it. Intervals
+    # ending before `since` only land in days that are dropped below.
+    load_start = (
+        None if since is None else since - timedelta(minutes=MAXIMUM_INTERVAL_MINUTES)
+    )
+    island_samples = load_island_samples(supabase_client, since=load_start)
+    samples_by_region = load_region_samples(supabase_client, since=load_start)
 
     if not island_samples:
         print("no snapshots found in the requested window; nothing to compute")
         return 0
 
-    computed_metrics = compute_metrics_for_scope(island_samples, ISLAND_SCOPE_NAME)
+    computed_metrics = compute_metrics_for_scope(
+        island_samples, ISLAND_SCOPE_NAME, granularities=METRIC_GRANULARITIES
+    )
     for region_name, region_samples in sorted(samples_by_region.items()):
         computed_metrics.extend(
-            compute_metrics_for_scope(region_samples, region_name)
+            compute_metrics_for_scope(
+                region_samples, region_name, granularities=METRIC_GRANULARITIES
+            )
         )
+
+    # Never write a day that starts before the window: its data is only
+    # partly loaded, and writing it would overwrite a complete row.
+    if since is not None:
+        computed_metrics = [
+            metric for metric in computed_metrics if metric.period_start >= since
+        ]
 
     written_count = write_reliability_metrics(supabase_client, computed_metrics)
     print(

@@ -58,7 +58,8 @@ grant select, insert on region_readings to service_role;
 -- per viewer) so every consumer reads identical numbers.
 --
 -- Periods are bucketed in America/Puerto_Rico local time, so a "day" is a
--- local calendar day rather than a UTC one.
+-- local calendar day rather than a UTC one. Only 'day' rows are computed now;
+-- 'hour' and 'month' stay allowed for rows left from older versions.
 --
 -- Index definitions and their confidence:
 --   saidi_minutes  - integral of the customers-out curve / customers served.
