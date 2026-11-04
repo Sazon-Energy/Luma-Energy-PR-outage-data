@@ -1,7 +1,9 @@
-"""Reads the stored metric tables that the dashboard renders.
+"""Reads the data the dashboard renders.
 
-The dashboard never recomputes anything - it only displays what
-`python -m src.metrics` already wrote, so every viewer sees identical numbers.
+The reliability indices are never recomputed here - the dashboard only
+displays what `python -m src.metrics` already wrote. The customers-out chart
+is the exception: it is a plain view of outage counts, so it is bucketed
+straight from the raw `outage_snapshots` rows (see `peak_customers_out_by_period`).
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from datetime import datetime
 
 from supabase import Client
 
-from src.metrics.reliability import ISLAND_SCOPE_NAME
+from src.metrics.reliability import ISLAND_SCOPE_NAME, OutageSample, truncate_to_period
 from src.retry import with_retry
 
 READ_PAGE_SIZE = 1000
@@ -30,6 +32,14 @@ class MetricPoint:
     mean_customers_without_service: float
     coverage_ratio: float | None
     customers_served: int
+
+
+@dataclass
+class CustomersOutPoint:
+    """Peak customers out during one hour or day, from raw snapshots."""
+
+    period_start: datetime
+    peak_customers_without_service: int
 
 
 @dataclass
@@ -110,35 +120,24 @@ def load_metric_series(
         offset += READ_PAGE_SIZE
 
 
-def load_snapshot_timestamps(
-    supabase_client: Client, since: datetime
-) -> list[datetime]:
-    """Every raw `source_timestamp` collected since `since`, oldest first.
+def peak_customers_out_by_period(
+    samples: list[OutageSample], granularity: str, cause_basis: str
+) -> list[CustomersOutPoint]:
+    """Highest customers-out count per local hour or day, oldest first.
 
-    Read straight from `outage_snapshots` rather than the derived metrics, so
-    sample coverage reflects exactly which LUMA publishes were captured.
+    Hourly and daily peaks are both maxima over the same raw samples, so a
+    day's peak always equals the highest of its hourly peaks.
     """
-    timestamps: list[datetime] = []
-    offset = 0
-
-    while True:
-        query = (
-            supabase_client.table("outage_snapshots")
-            .select("source_timestamp")
-            .gte("source_timestamp", since.isoformat())
-        )
-        response = with_retry(
-            lambda: query.order("source_timestamp")
-            .range(offset, offset + READ_PAGE_SIZE - 1)
-            .execute(),
-            description="select outage_snapshots",
-        )
-        rows = response.data or []
-        timestamps.extend(_parse_timestamp(row["source_timestamp"]) for row in rows)
-
-        if len(rows) < READ_PAGE_SIZE:
-            return timestamps
-        offset += READ_PAGE_SIZE
+    peak_by_period_start: dict[datetime, int] = {}
+    for sample in samples:
+        period_start = truncate_to_period(sample.source_timestamp, granularity)
+        customers_out = sample.customers_out_for_basis(cause_basis)
+        if customers_out > peak_by_period_start.get(period_start, -1):
+            peak_by_period_start[period_start] = customers_out
+    return [
+        CustomersOutPoint(period_start=period_start, peak_customers_without_service=peak)
+        for period_start, peak in sorted(peak_by_period_start.items())
+    ]
 
 
 def load_major_event_days(

@@ -20,7 +20,7 @@ import plotly.graph_objects as graph_objects
 import plotly.io as plotly_io
 from plotly.subplots import make_subplots
 
-from src.dashboard.data import MajorEventDayPoint, MetricPoint
+from src.dashboard.data import CustomersOutPoint, MajorEventDayPoint, MetricPoint
 from src.metrics.reliability import PUERTO_RICO_TIMEZONE
 
 PLOTLY_TEMPLATE = "plotly_white"
@@ -162,7 +162,7 @@ def _to_puerto_rico_wall_clocks(moments: list[datetime]) -> list[datetime]:
 
 
 def _customers_out_axis(
-    points_by_cause: dict[str, list[MetricPoint]], limit: int
+    points_by_cause: dict[str, list[CustomersOutPoint]], limit: int
 ) -> list[datetime]:
     all_period_starts = {
         point.period_start for points in points_by_cause.values() for point in points
@@ -185,7 +185,7 @@ def _limit_to_recent_days(
 
 
 def _customers_out_series(
-    points: list[MetricPoint], axis: list[datetime]
+    points: list[CustomersOutPoint], axis: list[datetime]
 ) -> list[float]:
     """Per-period peak customers-out values, aligned to `axis`.
 
@@ -202,8 +202,8 @@ def _customers_out_series(
 
 
 def _customers_out_segments_with_data(
-    hourly_points_by_cause: dict[str, list[MetricPoint]],
-    daily_points_by_cause: dict[str, list[MetricPoint]],
+    hourly_points_by_cause: dict[str, list[CustomersOutPoint]],
+    daily_points_by_cause: dict[str, list[CustomersOutPoint]],
 ) -> list[tuple[str, str, str]]:
     """`CUSTOMERS_OUT_SEGMENTS` minus any hide-when-empty segment that has no
     nonzero value at either granularity."""
@@ -221,9 +221,9 @@ def _customers_out_segments_with_data(
 
 
 def _build_customers_out_figure(
-    hourly_points_by_cause: dict[str, list[MetricPoint]],
+    hourly_points_by_cause: dict[str, list[CustomersOutPoint]],
     daily_axis: list[datetime],
-    daily_points_by_cause: dict[str, list[MetricPoint]],
+    daily_points_by_cause: dict[str, list[CustomersOutPoint]],
     shown_segments: list[tuple[str, str, str]],
 ) -> tuple[graph_objects.Figure, list[datetime]]:
     """Build the figure with hourly and daily trace groups baked in.
@@ -667,8 +667,8 @@ def build_window_controls_script(
 
 
 def build_customers_out_section(
-    hourly_points_by_cause: dict[str, list[MetricPoint]],
-    daily_points_by_cause: dict[str, list[MetricPoint]],
+    hourly_points_by_cause: dict[str, list[CustomersOutPoint]],
+    daily_points_by_cause: dict[str, list[CustomersOutPoint]],
     snapshot_timestamps: list[datetime],
     generated_at: datetime,
 ) -> str:
@@ -1565,8 +1565,8 @@ SOURCE_NOTES = [
 
 
 def build_main_page_html(
-    hourly_points_by_cause: dict[str, list[MetricPoint]],
-    daily_points_by_cause: dict[str, list[MetricPoint]],
+    hourly_points_by_cause: dict[str, list[CustomersOutPoint]],
+    daily_points_by_cause: dict[str, list[CustomersOutPoint]],
     snapshot_timestamps: list[datetime],
     generated_at: datetime,
 ) -> str:
@@ -1755,8 +1755,8 @@ def build_site_pages(
     daily_points: list[MetricPoint],
     region_daily_points: list[MetricPoint],
     major_event_days: list[MajorEventDayPoint],
-    hourly_points_by_cause: dict[str, list[MetricPoint]],
-    daily_points_by_cause: dict[str, list[MetricPoint]],
+    hourly_points_by_cause: dict[str, list[CustomersOutPoint]],
+    daily_points_by_cause: dict[str, list[CustomersOutPoint]],
     snapshot_timestamps: list[datetime],
 ) -> dict[str, str]:
     """Every page of the site, keyed by file name."""
