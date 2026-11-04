@@ -18,8 +18,10 @@ from src.dashboard.data import (
     load_collection_attempts,
     load_major_event_days,
     load_metric_series,
-    load_snapshot_timestamps,
+    peak_customers_out_by_period,
 )
+from src.metrics.reliability import GRANULARITY_DAY, GRANULARITY_HOUR
+from src.metrics.store import load_island_samples
 from src.dashboard.status import (
     STATUS_HISTORY_DAYS,
     STATUS_PAGE_FILE_NAME,
@@ -29,6 +31,7 @@ from src.supabase_writer import build_supabase_client
 
 DEFAULT_OUTPUT_DIRECTORY = Path("site")
 DASHBOARD_CAUSE_BASIS = "all"
+CUSTOMERS_OUT_CAUSE_BASES = ("unplanned", "planned", "load_shed")
 
 
 def main() -> int:
@@ -61,20 +64,26 @@ def main() -> int:
         supabase_client, cause_basis=DASHBOARD_CAUSE_BASIS
     )
 
-    snapshot_timestamps = load_snapshot_timestamps(
+    # One read of the raw island-wide snapshots feeds both the customers-out
+    # chart and sample coverage. The chart is bucketed from these rows rather
+    # than from `reliability_metrics`, so it always matches `outage_snapshots`.
+    island_samples = load_island_samples(
         supabase_client,
         since=datetime.now(timezone.utc) - timedelta(days=MAXIMUM_HISTORY_DAYS + 1),
     )
+    snapshot_timestamps = [sample.source_timestamp for sample in island_samples]
 
     hourly_points_by_cause = {
-        "unplanned": load_metric_series(supabase_client, "hour", cause_basis="unplanned"),
-        "planned": load_metric_series(supabase_client, "hour", cause_basis="planned"),
-        "load_shed": load_metric_series(supabase_client, "hour", cause_basis="load_shed"),
+        cause_basis: peak_customers_out_by_period(
+            island_samples, GRANULARITY_HOUR, cause_basis
+        )
+        for cause_basis in CUSTOMERS_OUT_CAUSE_BASES
     }
     daily_points_by_cause = {
-        "unplanned": load_metric_series(supabase_client, "day", cause_basis="unplanned"),
-        "planned": load_metric_series(supabase_client, "day", cause_basis="planned"),
-        "load_shed": load_metric_series(supabase_client, "day", cause_basis="load_shed"),
+        cause_basis: peak_customers_out_by_period(
+            island_samples, GRANULARITY_DAY, cause_basis
+        )
+        for cause_basis in CUSTOMERS_OUT_CAUSE_BASES
     }
 
     pages_by_file_name = build_site_pages(
