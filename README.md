@@ -29,7 +29,7 @@ best-effort schedule: every 30 min as a fallback)
   -> python -m src.metrics      recompute reliability indices from history
 Supabase (Postgres)
   outage_snapshots (1) --- (many) region_readings
-  reliability_metrics            hourly/daily/monthly SAIDI/SAIFI/CAIDI/ASAI
+  reliability_metrics            daily SAIDI/SAIFI/CAIDI/ASAI
   major_event_days               IEEE 1366 Major Event Day classification
   collection_attempts            one row per fetch attempt (collection health)
 
@@ -142,11 +142,18 @@ indices are not all equally solid:
 | **CAIDI** | Estimated (upper bound) | = SAIDI / SAIFI, so it inherits SAIFI's downward bias. It doubles as the customer-weighted average restoration time. |
 | MAIFI (momentary interruptions) | Not computed | Undetectable at a 10-minute sampling interval. |
 
-All four are computed per region and island-wide, hourly/daily/monthly, and
+All four are computed per region and island-wide, per local day, and
 split by cause (`all`, `unplanned`, `planned`, `load_shed` - `planned` and
 `load_shed` are confirmed subsets of "without service" in the source data).
 The dashboard defaults to `all`; the other splits are already stored in
 `reliability_metrics` for later exposure (see Roadmap).
+
+Only daily rows are computed: IEEE 1366 Major Event Days are defined on daily
+SAIDI, and every index on the dashboard is built from day rows (longer
+windows are sums of days). Each run recomputes the last few complete local
+days, starting at Puerto Rico midnight, and never writes a day it has only
+partly loaded. Rows with `granularity` `hour` or `month` left from older
+versions are no longer updated.
 
 **Major Event Days** are classified with the IEEE 1366 2.5 Beta Method
 ([src/metrics/major_event_days.py](src/metrics/major_event_days.py)):

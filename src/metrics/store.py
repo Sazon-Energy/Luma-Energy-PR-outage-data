@@ -8,9 +8,11 @@ from supabase import Client
 
 from src.metrics.major_event_days import DailySaidiValue, MajorEventDayClassification
 from src.metrics.reliability import (
+    GRANULARITY_DAY,
     ISLAND_SCOPE_NAME,
     OutageSample,
     ReliabilityMetrics,
+    truncate_to_period,
 )
 from src.retry import with_retry
 
@@ -249,5 +251,11 @@ def earliest_timestamp_for_lookback(lookback_days: int) -> datetime:
     A lookback is enough because only recent periods can still change; older
     periods are already final. Recomputing an extra day is cheap insurance
     against a late-arriving or backfilled sample.
+
+    The start is snapped back to local (Puerto Rico) midnight so the window
+    always begins on a day boundary. A rolling instant would leave the oldest
+    day only partly inside the window, and rewriting it from that partial
+    slice on every run is what used to wipe out older days' metrics.
     """
-    return datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    rolling_start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    return truncate_to_period(rolling_start, GRANULARITY_DAY)

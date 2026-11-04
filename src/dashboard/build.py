@@ -93,8 +93,6 @@ TERM_SUMMARIES = {
     "CAIDI": "Average restoration time",
     "Major Event Day": "Extreme outage day",
     "T_MED": "Major-event threshold",
-    "Mean": "Hourly average",
-    "Peak": "Hourly maximum",
     "Unplanned": "Faults and damage",
     "Planned": "Scheduled work",
     "Load shed": "Deliberate supply cuts",
@@ -708,45 +706,6 @@ def build_customers_out_section(
     clock_html = build_puerto_rico_clock_markup()
 
     return f"{controls_html}{figure_html}{key_html}{clock_html}{script_html}"
-
-
-def build_outage_level_figure(hourly_points: list[MetricPoint]) -> str:
-    """Customers without service over time - the raw signal everything derives from."""
-    if not hourly_points:
-        return _empty_state("No hourly data collected yet.")
-
-    recent_points = _limit_to_recent_days(hourly_points, MAXIMUM_HISTORY_DAYS)
-    figure = graph_objects.Figure()
-    figure.add_trace(
-        graph_objects.Scatter(
-            x=[_to_puerto_rico_wall_clock(point.period_start) for point in recent_points],
-            y=[point.mean_customers_without_service for point in recent_points],
-            name="Mean customers out",
-            mode="lines",
-            line=dict(color=COLOR_PRIMARY, width=2),
-            fill="tozeroy",
-            fillcolor=COLOR_PRIMARY_FILL,
-            hovertemplate="%{y:,.0f} customers<extra>mean</extra>",
-        )
-    )
-    figure.add_trace(
-        graph_objects.Scatter(
-            x=[_to_puerto_rico_wall_clock(point.period_start) for point in recent_points],
-            y=[point.peak_customers_without_service for point in recent_points],
-            name="Peak customers out",
-            mode="lines",
-            line=dict(color=COLOR_ACCENT, width=1, dash="dot"),
-            hovertemplate="%{y:,.0f} customers<extra>peak</extra>",
-        )
-    )
-    figure.update_layout(
-        title="Customers without service (hourly)",
-        yaxis_title="Customers",
-        xaxis_title=None,
-        xaxis_hoverformat=HOURLY_HOVER_FORMAT,
-        legend=dict(orientation="h", y=1.12, x=0),
-    )
-    return _figure_to_html(figure) + _chart_key(["Mean", "Peak"])
 
 
 def build_daily_saidi_figure(
@@ -1584,7 +1543,6 @@ def build_main_page_html(
 
 
 def build_indices_page_html(
-    hourly_points: list[MetricPoint],
     daily_points: list[MetricPoint],
     region_daily_points: list[MetricPoint],
     major_event_days: list[MajorEventDayPoint],
@@ -1617,7 +1575,6 @@ def build_indices_page_html(
     </div>
     <p class="data-range-note">{html.escape(coverage_sentence)}</p>
     {build_kpi_cards(summary)}
-    <div class="panel">{build_outage_level_figure(hourly_points)}</div>
     <div class="panel">{build_daily_saidi_figure(daily_points, major_event_days)}</div>
     <div class="panel">{build_cumulative_saidi_figure(daily_points)}</div>
     <div class="panel">{build_index_trend_figure(daily_points)}</div>
@@ -1751,7 +1708,6 @@ def build_indices_page_html(
 
 
 def build_site_pages(
-    hourly_points: list[MetricPoint],
     daily_points: list[MetricPoint],
     region_daily_points: list[MetricPoint],
     major_event_days: list[MajorEventDayPoint],
@@ -1766,6 +1722,6 @@ def build_site_pages(
             hourly_points_by_cause, daily_points_by_cause, snapshot_timestamps, generated_at
         ),
         INDICES_PAGE_FILE_NAME: build_indices_page_html(
-            hourly_points, daily_points, region_daily_points, major_event_days, generated_at
+            daily_points, region_daily_points, major_event_days, generated_at
         ),
     }

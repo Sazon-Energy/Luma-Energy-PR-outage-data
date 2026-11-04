@@ -48,9 +48,6 @@ def main() -> int:
 
     supabase_client = build_supabase_client()
 
-    hourly_points = load_metric_series(
-        supabase_client, "hour", cause_basis=DASHBOARD_CAUSE_BASIS
-    )
     daily_points = load_metric_series(
         supabase_client, "day", cause_basis=DASHBOARD_CAUSE_BASIS
     )
@@ -87,7 +84,6 @@ def main() -> int:
     }
 
     pages_by_file_name = build_site_pages(
-        hourly_points=hourly_points,
         daily_points=daily_points,
         region_daily_points=region_daily_points,
         major_event_days=major_event_days,
@@ -123,7 +119,7 @@ def main() -> int:
 
     print(
         f"wrote {', '.join(pages_by_file_name)} to {arguments.output_directory} "
-        f"({len(hourly_points)} hourly, {len(daily_points)} daily, "
+        f"({len(daily_points)} daily, "
         f"{len(region_daily_points)} regional rows)"
     )
     return 0
