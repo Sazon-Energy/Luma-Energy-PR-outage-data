@@ -5,11 +5,16 @@ Unlinked from the public pages (bookmark it). Coverage is computed from
 `collection_attempts` log explains each miss: which method ran, how long it
 took and what came back. A miss with no attempts at all means the run never
 started or died before fetching (pg_cron trigger, GitHub Actions, setup).
+
+A Publishing section below that covers the "Publish reliability dashboard"
+workflow itself (success rate, gaps between deploys, duration, failed runs),
+read from the GitHub Actions API by `src.dashboard.publish_runs`.
 """
 
 from __future__ import annotations
 
 import html
+import math
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 
@@ -41,6 +46,13 @@ from src.dashboard.build import (
     expected_samples_for_day,
 )
 from src.dashboard.data import CollectionAttempt
+from src.dashboard.publish_runs import (
+    CONCLUSION_CANCELLED,
+    CONCLUSION_FAILURE,
+    CONCLUSION_SKIPPED,
+    CONCLUSION_SUCCESS,
+    PublishRun,
+)
 from src.metrics.reliability import PUERTO_RICO_TIMEZONE
 
 STATUS_PAGE_FILE_NAME = "status.html"
@@ -67,6 +79,18 @@ OUTCOME_DISPLAY = [
 OUTCOME_LABELS = {outcome: label for outcome, label, _ in OUTCOME_DISPLAY}
 OUTCOME_COLORS = {outcome: color for outcome, _, color in OUTCOME_DISPLAY}
 METHOD_LABELS = {METHOD_DIRECT: "Direct", METHOD_BROWSERLESS: "Browserless"}
+
+FAILED_PUBLISH_TABLE_DAYS = 7
+FAILED_PUBLISH_TABLE_LIMIT = 50
+
+# Stack order and colors for publish runs, reusing the outcome palette:
+# success matches "Captured" and failure matches "Write error".
+PUBLISH_RESULT_DISPLAY = [
+    (CONCLUSION_SUCCESS, "Success", "#2a78d6"),
+    (CONCLUSION_FAILURE, "Failure", "#e34948"),
+    (CONCLUSION_CANCELLED, "Cancelled", "#eda100"),
+    (CONCLUSION_SKIPPED, "Skipped (collection cancelled)", "#94a3b8"),
+]
 
 TABLE_TIME_FORMAT = "%b %-d, %H:%M AST"
 
@@ -111,12 +135,15 @@ def _group_attempts_into_runs(
     return list(attempts_by_run.values())
 
 
-def _kpi_card(name: str, value: str, note: str) -> str:
+def _kpi_card(name: str, value: str, note: str, note_link_url: str | None = None) -> str:
+    note_markup = html.escape(note)
+    if note_link_url:
+        note_markup = f'<a href="{html.escape(note_link_url)}">{note_markup}</a>'
     return f"""
         <div class="kpi-card">
           <div class="kpi-header"><span class="kpi-name">{html.escape(name)}</span></div>
           <div class="kpi-value">{html.escape(value)}</div>
-          <div class="kpi-note">{html.escape(note)}</div>
+          <div class="kpi-note">{note_markup}</div>
         </div>"""
 
 
@@ -416,13 +443,206 @@ def build_failed_attempts_table(attempts: list[CollectionAttempt]) -> str:
       </table>"""
 
 
+def _format_elapsed(seconds: float) -> str:
+    """A short duration such as "48 s", "12 min" or "3 h 05 min"."""
+    seconds = max(0, round(seconds))
+    if seconds < 120:
+        return f"{seconds} s"
+    minutes = round(seconds / 60)
+    if minutes < 120:
+        return f"{minutes} min"
+    return f"{minutes // 60} h {minutes % 60:02d} min"
+
+
+def _nearest_rank_percentile(sorted_values: list[float], percentile: float) -> float:
+    rank = max(1, math.ceil(percentile / 100 * len(sorted_values)))
+    return sorted_values[rank - 1]
+
+
+def build_publish_kpi_cards(publish_runs: list[PublishRun], generated_at: datetime) -> str:
+    cards = []
+    for window_label, window in (
+        ("24 h", timedelta(hours=24)),
+        ("7 d", timedelta(days=7)),
+        ("30 d", timedelta(days=30)),
+    ):
+        window_start = generated_at - window
+        decided_runs = [
+            run
+            for run in publish_runs
+            if run.created_at >= window_start
+            and run.conclusion in (CONCLUSION_SUCCESS, CONCLUSION_FAILURE)
+        ]
+        failed_count = sum(
+            1 for run in decided_runs if run.conclusion == CONCLUSION_FAILURE
+        )
+        cards.append(
+            _kpi_card(
+                f"Publish success {window_label}",
+                _format_percentage(len(decided_runs) - failed_count, len(decided_runs), 2),
+                f"{failed_count:,} of {len(decided_runs):,} runs failed",
+            )
+        )
+
+    failed_runs = [run for run in publish_runs if run.conclusion == CONCLUSION_FAILURE]
+    if failed_runs:
+        last_failed_run = failed_runs[-1]
+        cards.append(
+            _kpi_card(
+                "Last failed publish",
+                f"{_to_puerto_rico_wall_clock(last_failed_run.created_at):{TABLE_TIME_FORMAT}}",
+                f"{_format_elapsed((generated_at - last_failed_run.created_at).total_seconds())}"
+                " ago · open run",
+                note_link_url=last_failed_run.html_url,
+            )
+        )
+    else:
+        cards.append(
+            _kpi_card("Last failed publish", "None", f"No failures in {STATUS_HISTORY_DAYS} d")
+        )
+
+    recent_window_start = generated_at - timedelta(days=7)
+    success_finish_times = sorted(
+        run.updated_at
+        for run in publish_runs
+        if run.conclusion == CONCLUSION_SUCCESS and run.updated_at >= recent_window_start
+    )
+    gaps_between_successes = [
+        (later - earlier).total_seconds()
+        for earlier, later in zip(success_finish_times, success_finish_times[1:])
+    ]
+    cards.append(
+        _kpi_card(
+            "Longest gap between publishes",
+            _format_elapsed(max(gaps_between_successes)) if gaps_between_successes else "—",
+            "Between successful deploys, last 7 d (normally ~10 min)",
+        )
+    )
+
+    recent_durations = sorted(
+        run.duration_seconds
+        for run in publish_runs
+        if run.created_at >= recent_window_start
+        and run.conclusion in (CONCLUSION_SUCCESS, CONCLUSION_FAILURE)
+    )
+    cards.append(
+        _kpi_card(
+            "Publish duration",
+            (
+                f"{_format_elapsed(_nearest_rank_percentile(recent_durations, 50))} / "
+                f"{_format_elapsed(_nearest_rank_percentile(recent_durations, 95))}"
+            )
+            if recent_durations
+            else "—",
+            "Median / 95th percentile, last 7 d (a deploy retry adds 30 s+)",
+        )
+    )
+    return f'<div class="kpi-grid">{"".join(cards)}</div>'
+
+
+def build_publish_runs_by_result_figure(
+    publish_runs: list[PublishRun], generated_at: datetime
+) -> str:
+    if not publish_runs:
+        return _empty_state("No publish runs found.")
+
+    counts: dict[str, dict[date, int]] = defaultdict(lambda: defaultdict(int))
+    for run in publish_runs:
+        local_day = run.created_at.astimezone(PUERTO_RICO_TIMEZONE).date()
+        counts[run.conclusion or "unknown"][local_day] += 1
+    today = generated_at.astimezone(PUERTO_RICO_TIMEZONE).date()
+    first_day = min(
+        run.created_at.astimezone(PUERTO_RICO_TIMEZONE).date() for run in publish_runs
+    )
+    days = [
+        first_day + timedelta(days=day_offset)
+        for day_offset in range((today - first_day).days + 1)
+    ]
+
+    figure = graph_objects.Figure()
+    for conclusion, label, color in PUBLISH_RESULT_DISPLAY:
+        conclusion_counts = counts.get(conclusion)
+        if not conclusion_counts:
+            continue
+        figure.add_trace(
+            graph_objects.Bar(
+                x=days,
+                y=[conclusion_counts.get(day, 0) for day in days],
+                name=label,
+                marker=dict(color=color, line=dict(color="#ffffff", width=2)),
+                hovertemplate=f"{label}: %{{y}}<extra></extra>",
+            )
+        )
+    figure.update_layout(
+        title="Publish runs per day by result (AST days, today partial)",
+        barmode="stack",
+        legend=dict(orientation="h", y=-0.15, x=0),
+    )
+    return _figure_to_html(figure, height=360)
+
+
+def build_failed_publish_runs_table(
+    publish_runs: list[PublishRun], generated_at: datetime
+) -> str:
+    window_start = generated_at - timedelta(days=FAILED_PUBLISH_TABLE_DAYS)
+    failed_runs = [
+        run
+        for run in publish_runs
+        if run.conclusion == CONCLUSION_FAILURE and run.created_at >= window_start
+    ]
+    if not failed_runs:
+        return _empty_state(
+            f"No failed publish runs in the last {FAILED_PUBLISH_TABLE_DAYS} days."
+        )
+
+    rows = []
+    for run in reversed(failed_runs[-FAILED_PUBLISH_TABLE_LIMIT:]):
+        description = html.escape(
+            f"{_format_elapsed(run.duration_seconds)} — "
+            f"{run.first_error_message or 'No error message recorded'}"
+        )
+        rows.append(
+            f'<tr><td data-label="Started">'
+            f"{_to_puerto_rico_wall_clock(run.created_at):{TABLE_TIME_FORMAT}}</td>"
+            f'<td data-label="Run">{description} · '
+            f'<a href="{html.escape(run.html_url)}">open run</a></td></tr>'
+        )
+    shown_note = (
+        f" (newest {FAILED_PUBLISH_TABLE_LIMIT} shown)"
+        if len(failed_runs) > FAILED_PUBLISH_TABLE_LIMIT
+        else ""
+    )
+    return f"""
+      <h2>Failed publish runs, last {FAILED_PUBLISH_TABLE_DAYS} days: {len(failed_runs):,}{shown_note}</h2>
+      <table class="callout-table">
+        <thead><tr><th>Started</th><th>Duration, first error and run</th></tr></thead>
+        <tbody>{"".join(rows)}</tbody>
+      </table>"""
+
+
 def build_status_page_html(
     snapshot_timestamps: list[datetime],
     attempts: list[CollectionAttempt],
+    publish_runs: list[PublishRun],
     generated_at: datetime,
 ) -> str:
     captured_slots = {_slot_start(timestamp) for timestamp in snapshot_timestamps}
     earliest_snapshot = min(snapshot_timestamps) if snapshot_timestamps else None
+
+    if publish_runs:
+        publishing_html = f"""
+    <div class="panel">
+      <h2>Publishing (earlier runs; the run that built this page isn't included)</h2>
+      {build_publish_kpi_cards(publish_runs, generated_at)}
+    </div>
+    <div class="panel">{build_publish_runs_by_result_figure(publish_runs, generated_at)}</div>
+    <div class="panel">{build_failed_publish_runs_table(publish_runs, generated_at)}</div>"""
+    else:
+        publishing_html = f"""
+    <div class="panel">
+      <h2>Publishing</h2>
+      {_empty_state("Publish run history unavailable (GitHub API not reachable or not configured).")}
+    </div>"""
 
     body_html = f"""
     <div class="panel">{build_status_kpi_cards(captured_slots, attempts, generated_at, earliest_snapshot)}</div>
@@ -430,13 +650,14 @@ def build_status_page_html(
     <div class="panel">{build_attempts_by_outcome_figure(attempts)}</div>
     <div class="panel">{build_attempt_duration_figure(attempts)}</div>
     <div class="panel">{build_missed_slots_table(captured_slots, attempts, generated_at, earliest_snapshot)}</div>
-    <div class="panel">{build_failed_attempts_table(attempts)}</div>"""
+    <div class="panel">{build_failed_attempts_table(attempts)}</div>{publishing_html}"""
     return _render_page(
         page_title="Collection Health",
         heading="Collection Health",
         lead=(
-            "How reliably each 10-minute LUMA publish is captured, and what "
-            "happened when one was missed."
+            "How reliably each 10-minute LUMA publish is captured, what "
+            "happened when one was missed, and how reliably this site is "
+            "published."
         ),
         current_page=STATUS_PAGE_FILE_NAME,
         body_html=body_html,

@@ -12,6 +12,8 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  # The status page's Publishing section reads this workflow's run history.
+  actions: read
 
 # Pages deploys must not overlap; queue rather than run concurrently.
 concurrency:
@@ -52,6 +54,9 @@ jobs:
 
       - name: Build dashboard
         run: python -m src.dashboard
+        env:
+          # For the status page's publish run history (src/dashboard/publish_runs.py).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/configure-pages@v6
 
