@@ -22,7 +22,9 @@ from src.dashboard.data import (
 )
 from src.metrics.reliability import GRANULARITY_DAY, GRANULARITY_HOUR
 from src.metrics.store import load_island_samples
+from src.dashboard.publish_runs import load_publish_runs
 from src.dashboard.status import (
+    FAILED_PUBLISH_TABLE_DAYS,
     STATUS_HISTORY_DAYS,
     STATUS_PAGE_FILE_NAME,
     build_status_page_html,
@@ -103,6 +105,16 @@ def main() -> int:
         # public pages must still publish; the status page shows coverage only.
         print(f"warning: could not load collection_attempts ({load_error})")
         collection_attempts = []
+    try:
+        publish_runs = load_publish_runs(
+            since=status_window_start,
+            error_details_since=generated_at - timedelta(days=FAILED_PUBLISH_TABLE_DAYS),
+        )
+    except Exception as load_error:
+        # The GitHub API being down or rate limited must never stop the
+        # public pages from publishing; the Publishing section shows a note.
+        print(f"warning: could not load publish run history ({load_error})")
+        publish_runs = []
     pages_by_file_name[STATUS_PAGE_FILE_NAME] = build_status_page_html(
         snapshot_timestamps=[
             timestamp
@@ -110,6 +122,7 @@ def main() -> int:
             if timestamp >= status_window_start
         ],
         attempts=collection_attempts,
+        publish_runs=publish_runs,
         generated_at=generated_at,
     )
 
