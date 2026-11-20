@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 15
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment_retry.outputs.page_url }}
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -59,6 +59,20 @@ jobs:
         with:
           path: site
 
+      # GitHub's artifact API occasionally doesn't list a just-uploaded
+      # artifact yet ("No artifacts named github-pages were found"), so a
+      # failed deploy gets a short wait and one more attempt. If the retry
+      # also fails, the job fails as before.
       - name: Deploy to GitHub Pages
         id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@v5
+
+      - name: Wait before retrying deploy
+        if: steps.deployment.outcome == 'failure'
+        run: sleep 30
+
+      - name: Retry deploy to GitHub Pages
+        id: deployment_retry
+        if: steps.deployment.outcome == 'failure'
         uses: actions/deploy-pages@v5
